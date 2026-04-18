@@ -134,7 +134,7 @@ defmodule PyreClient.Channel do
     %Message{topic: @topic, event: "action", payload: payload},
     %{status: :joined} = ch
   ) do
-    Logger.info("[PyreClient.Channel] Received action: #{payload["type"]} (#{payload["execution_id"]})")
+    Logger.info("[PyreClient.Channel] Received action: #{payload["action"]} (#{payload["execution_id"]})")
 
     # Delegate to executor — it will send frames back via Connection casts
     Executor.handle_action(payload)

@@ -2,7 +2,7 @@
 
 ## Design Principle
 
-`pyre_client` is the **execution layer** for the Pyre platform. It owns all LLM backends, the tool system, the agentic loop, and session management. It connects to a Pyre Web server as a worker, receives dispatched actions, and executes them locally.
+`pyre_client` is the **execution layer** for the Pyre platform. It owns all LLM backends, the tool system, the agentic loop, session management, git operations, and GitHub API interactions. It connects to a Pyre Web server as a worker, receives named action types (`prompt`, `git_pr_setup`, `git_ship`, `git_review`), and executes the full action lifecycle locally.
 
 It has **no dependency on pyre_lib** — they are independent peer libraries composed by the host app. pyre_client depends on `req_llm` directly (no jido transitive dependency).
 
@@ -32,6 +32,14 @@ pyre_client/
 │   │   ├── tools.ex                   # PyreClient.Tools — tool definitions for ReqLLM
 │   │   ├── tools/
 │   │   │   └── agentic_loop.ex        # PyreClient.Tools.AgenticLoop — multi-turn tool loop
+│   │   ├── actions.ex                 # PyreClient.Actions — behaviour + routing registry
+│   │   ├── actions/
+│   │   │   ├── prompt.ex              # PyreClient.Actions.Prompt — LLM call → return text
+│   │   │   ├── git_pr_setup.ex        # PyreClient.Actions.GitPRSetup — LLM → parse → git → draft PR
+│   │   │   ├── git_ship.ex            # PyreClient.Actions.GitShip — LLM → parse → git → PR
+│   │   │   ├── git_review.ex          # PyreClient.Actions.GitReview — LLM → parse verdict → git → comment
+│   │   │   ├── git.ex                 # PyreClient.Actions.Git — shared git/parsing utilities
+│   │   │   └── github.ex              # PyreClient.Actions.GitHub — lightweight GitHub API client
 │   │   └── session/
 │   │       ├── session.ex             # PyreClient.Session — UUID generation
 │   │       └── registry.ex            # PyreClient.Session.Registry — backend ID mapping
@@ -43,6 +51,13 @@ pyre_client/
     │   ├── protocol_test.exs
     │   ├── executor_test.exs
     │   ├── tools_test.exs
+    │   ├── actions_test.exs
+    │   ├── actions/
+    │   │   ├── prompt_test.exs
+    │   │   ├── git_pr_setup_test.exs
+    │   │   ├── git_ship_test.exs
+    │   │   ├── git_review_test.exs
+    │   │   └── git_test.exs
     │   └── llm/
     │       ├── config_test.exs
     │       ├── claude_cli_test.exs
@@ -120,6 +135,7 @@ end
 | `req_llm` | LLM HTTP client, tool types, response classification | `ReqLLM.generate_text/3`, `ReqLLM.stream_text/3`, `ReqLLM.Context`, `ReqLLM.Response`, `ReqLLM.Tool`, `ReqLLM.ToolCall` |
 | `websockex` | OTP-compatible WebSocket client | Connection lifecycle, ping/pong |
 | `jason` | JSON encoding/decoding | Phoenix Channel V2 protocol, CLI backend output parsing |
+| `req` | HTTP client (transitive via req_llm, explicit for clarity) | GitHub API calls in git action modules (`Actions.GitHub`) |
 | `bandit` + `phoenix` | Test-only | Spin up a real Phoenix endpoint for integration tests |
 
 **Why `req_llm`?** Three reasons:
@@ -391,7 +407,7 @@ defmodule PyreClient.LLM.Config do
   Resolves a model tier string to a concrete model identifier.
 
   The server sends tier names ("fast", "standard", "advanced") in
-  execute_prompt payloads. Each client resolves them to backend-appropriate
+  action payloads. Each client resolves them to backend-appropriate
   model strings. CLI backends further map these internally (e.g.,
   ClaudeCLI maps "anthropic:claude-haiku-4-5" → "haiku").
 

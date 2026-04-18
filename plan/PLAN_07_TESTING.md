@@ -6,9 +6,10 @@ Testing covers the full execution layer: WebSocket client, LLM backends, tool sy
 
 1. **Unit tests** — Protocol encoding/decoding, Channel state machine, LLM Config, Session
 2. **Tool tests** — Tool definitions, path validation, command sandboxing
-3. **Executor tests** — Command execution and LLM routing
-4. **LLM backend tests** — Mock backend, ClaudeCLI (with overridden executable)
-5. **Integration tests** — Connection against a real (minimal) Phoenix endpoint
+3. **Action module tests** — Actions behaviour routing, Prompt execution, Git utilities, GitHub API
+4. **Executor tests** — Action dispatch routing and LLM routing
+5. **LLM backend tests** — Mock backend, ClaudeCLI (with overridden executable)
+6. **Integration tests** — Connection against a real (minimal) Phoenix endpoint
 
 ## Layer 1: Unit Tests (No Network)
 
@@ -34,7 +35,7 @@ defmodule PyreClient.ProtocolTest do
   end
 
   test "decode V2 array format" do
-    raw = ~s(["1","2","pyre:connections","action",{"type":"execute_prompt"}])
+    raw = ~s(["1","2","pyre:connections","action",{"action":"prompt"}])
     assert {:ok, msg} = Protocol.decode(raw)
     assert msg.join_ref == "1"
     assert msg.ref == "2"
@@ -277,9 +278,116 @@ defmodule PyreClient.ToolsTest do
 end
 ```
 
-## Layer 3: Executor Tests
+## Layer 3: Action Module Tests
 
-The Executor is a GenServer that spawns execution processes. Testing the full dispatch flow requires the Connection process (for `send_to_server`), so executor tests are deferred to the integration layer. The LLM routing logic is exercised indirectly through the LLM backend tests and AgenticLoop tests.
+### Actions Registry Tests
+
+```elixir
+# test/pyre_client/actions_test.exs
+defmodule PyreClient.ActionsTest do
+  use ExUnit.Case, async: true
+
+  alias PyreClient.Actions
+
+  test "resolve returns correct modules for known action types" do
+    assert {:ok, PyreClient.Actions.Prompt} = Actions.resolve("prompt")
+    assert {:ok, PyreClient.Actions.GitPRSetup} = Actions.resolve("git_pr_setup")
+    assert {:ok, PyreClient.Actions.GitShip} = Actions.resolve("git_ship")
+    assert {:ok, PyreClient.Actions.GitReview} = Actions.resolve("git_review")
+  end
+
+  test "resolve returns :error for unknown action types" do
+    assert :error = Actions.resolve("unknown")
+    assert :error = Actions.resolve("execute_commands")
+  end
+end
+```
+
+### Git Utilities Tests
+
+```elixir
+# test/pyre_client/actions/git_test.exs
+defmodule PyreClient.Actions.GitTest do
+  use ExUnit.Case, async: true
+
+  alias PyreClient.Actions.Git
+
+  test "parse_verdict detects APPROVE" do
+    text = """
+    I've reviewed the code thoroughly.
+
+    APPROVE - The implementation looks correct.
+    """
+
+    assert Git.parse_verdict(text) == "approve"
+  end
+
+  test "parse_verdict detects REJECT" do
+    text = """
+    Several issues found.
+
+    REJECT - Missing error handling.
+    """
+
+    assert Git.parse_verdict(text) == "reject"
+  end
+
+  test "parse_verdict returns unknown for ambiguous text" do
+    assert Git.parse_verdict("This code looks fine.") == "unknown"
+  end
+
+  test "parse_shipping_plan extracts structured fields" do
+    text = """
+    branch_name: feature/add-auth
+    commit_message: Add authentication module
+    pr_title: Add user authentication
+    pr_body: Implements JWT-based auth with login/logout endpoints.
+    """
+
+    assert {:ok, plan} = Git.parse_shipping_plan(text)
+    assert plan.branch_name == "feature/add-auth"
+    assert plan.commit_message == "Add authentication module"
+    assert plan.pr_title == "Add user authentication"
+  end
+
+  test "parse_shipping_plan returns error for missing fields" do
+    assert {:error, :parse_failed} = Git.parse_shipping_plan("just some text")
+  end
+end
+```
+
+### Prompt Action Tests
+
+```elixir
+# test/pyre_client/actions/prompt_test.exs
+defmodule PyreClient.Actions.PromptTest do
+  use ExUnit.Case, async: false
+
+  alias PyreClient.Actions.Prompt
+
+  test "execute returns text from LLM" do
+    Process.put(:mock_llm_responses, [{:ok, "Generated architecture design"}])
+
+    context = %{
+      execution_id: "test-1",
+      backend: PyreClient.LLM.Mock,
+      model: "standard",
+      tools: [],
+      opts: [messages: [%{role: :user, content: "Design an API"}], streaming: false],
+      output_fn: fn _ -> :ok end,
+      send_to_server: fn _, _ -> :ok end,
+      interactive?: false
+    }
+
+    assert {:ok, %{"text" => "Generated architecture design"}} =
+      Prompt.execute(%{}, context)
+  end
+end
+```
+
+## Layer 4: Executor Tests
+
+The Executor is a GenServer that spawns execution processes. Testing the full dispatch flow requires the Connection process (for `send_to_server`), so executor tests are deferred to the integration layer. The action routing logic is tested via the Actions registry tests above. The LLM routing logic is exercised indirectly through the LLM backend tests and AgenticLoop tests.
 
 ## Layer 4: LLM Backend Tests
 
@@ -456,6 +564,11 @@ defmodule PyreClient.Test.MockServer do
       {:noreply, socket}
     end
 
+    def handle_in("action_result", payload, socket) do
+      if pid = Process.get(:test_pid), do: send(pid, {:action_result, payload})
+      {:noreply, socket}
+    end
+
     def handle_in("action_complete", payload, socket) do
       if pid = Process.get(:test_pid), do: send(pid, {:action_complete, payload})
       {:noreply, socket}
@@ -536,6 +649,12 @@ end
 | `Session` | Unit | Yes | None (`:crypto`) |
 | `Session.Registry` | Unit | No | Agent process |
 | `Tools` | Unit | Yes | `req_llm` (for `ReqLLM.Tool`) |
+| `Actions` | Unit | Yes | None (registry only) |
+| `Actions.Prompt` | Unit | No | Mock LLM (process dictionary) |
+| `Actions.Git` | Unit | Yes | None (pure parsing + filesystem) |
+| `Actions.GitPRSetup` | Integration | No | Mock LLM, git, GitHub |
+| `Actions.GitShip` | Integration | No | Mock LLM, git, GitHub |
+| `Actions.GitReview` | Integration | No | Mock LLM, git, GitHub |
 | `Executor` | Integration | No | MockServer (via Connection) |
 | `PyreClient.LLM.Mock` | Unit | No | Process dictionary |
 | `PyreClient.LLM.ClaudeCLI` | Unit | No | Application env |

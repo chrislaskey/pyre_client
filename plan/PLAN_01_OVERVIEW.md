@@ -6,9 +6,9 @@
 
 An Elixir library (`pyre_client`) that is the **execution layer** for the Pyre platform. It owns all LLM backends, the tool system, the agentic loop, session management, and the WebSocket client that connects to a Pyre Web server.
 
-pyre_client connects as a worker, receives dispatched actions (LLM prompts), executes them locally, and streams results back. It is a thin client with no knowledge of workflows, stages, or orchestration.
+pyre_client connects as a worker, receives dispatched actions, executes them locally, and streams results back. It owns the full lifecycle of each action — LLM calls, response parsing, git operations, and GitHub API interactions. It has no knowledge of workflows, stages, or orchestration.
 
-pyre_lib is the **orchestration layer** — it runs workflows, dispatches actions to workers, and serves the web UI. It does not execute actions locally or call LLM backends directly.
+pyre_lib is the **orchestration layer** — it runs workflows, dispatches named action types to workers, and serves the web UI. It does not execute actions locally or call LLM backends directly. It builds action payloads and interprets results, but the client owns all execution logic.
 
 **CRITICAL — This is a MOVE, not a copy.** The execution modules listed below currently live in pyre_lib. They are being **relocated** to pyre_client as their permanent, sole home. After pyre_client is built, these modules will be **deleted** from pyre_lib entirely. There must be exactly ONE implementation of each module — in pyre_client. Do NOT duplicate code across both libraries. Do NOT leave stubs, re-exports, or compatibility shims in pyre_lib. The source of truth for all LLM backends, tools, the agentic loop, and session management is pyre_client. pyre_lib will be refactored later (see "Future pyre_lib Changes") to dispatch to workers instead of calling these modules directly.
 
@@ -64,6 +64,13 @@ All backend execution modules **move** from pyre_lib to pyre_client. The "Source
 | _(new)_ | `PyreClient.Channel` | Phoenix channel state machine |
 | _(new)_ | `PyreClient.Protocol` | Phoenix V2 wire protocol |
 | _(new)_ | `PyreClient.Executor` | Action dispatch and execution |
+| _(new)_ | `PyreClient.Actions` | Action behaviour + routing registry |
+| _(new)_ | `PyreClient.Actions.Prompt` | LLM call → return text (covers 9 of 11 server actions) |
+| _(new)_ | `PyreClient.Actions.GitPRSetup` | LLM → parse → git → draft GitHub PR |
+| _(new)_ | `PyreClient.Actions.GitShip` | LLM → parse → git → GitHub PR |
+| _(new)_ | `PyreClient.Actions.GitReview` | LLM → parse verdict → git → GitHub comment |
+| _(new)_ | `PyreClient.Actions.Git` | Shared git/parsing utilities |
+| _(new)_ | `PyreClient.Actions.GitHub` | Lightweight GitHub API client (3 endpoints) |
 
 ### What Stays in pyre_lib
 
@@ -76,7 +83,7 @@ All backend execution modules **move** from pyre_lib to pyre_client. The "Source
 | `Pyre.Plugins.*` | Persona loading, artifact management |
 | `PyreWeb.*` | Web UI, LiveViews, channels, router |
 
-After the migration is complete, pyre_lib retains **zero** LLM backends, tools, agentic loop code, or session management. All of `Pyre.LLM`, `Pyre.LLM.*`, `Pyre.Tools`, `Pyre.Tools.AgenticLoop`, `Pyre.Session`, and `Pyre.Session.Registry` will be deleted from pyre_lib. Its actions will dispatch `execute_prompt` to workers instead of calling `Helpers.call_llm/4` directly. This refactoring happens separately after pyre_client is built.
+After the migration is complete, pyre_lib retains **zero** LLM backends, tools, agentic loop code, or session management. All of `Pyre.LLM`, `Pyre.LLM.*`, `Pyre.Tools`, `Pyre.Tools.AgenticLoop`, `Pyre.Session`, and `Pyre.Session.Registry` will be deleted from pyre_lib. Its actions will dispatch named action types (`prompt`, `git_pr_setup`, `git_ship`, `git_review`) to workers instead of calling `Helpers.call_llm/4` directly. This refactoring happens separately after pyre_client is built.
 
 ### Deployment Model
 
@@ -99,33 +106,52 @@ All worker types are identical from the server's perspective. The "local" client
 
 ### Execution Flow
 
-When pyre_lib dispatches an action to a worker:
+When pyre_lib dispatches an action to a worker, it sends a named action type with data parameters. The client routes to the appropriate action module, which owns the full execution lifecycle. The server never sends shell commands or arbitrary code — the client decides what to execute based on hardcoded action implementations. This is a security requirement: if the server could send arbitrary commands over WebSocket, anyone with WebSocket access could compromise the client machine.
 
-**Non-interactive** (e.g., code review, task):
-
-```
-pyre_lib (server)                    pyre_client (worker)
-─────────────────                    ────────────────────
-Flow.run_action()
-  → dispatch execute_prompt          → Executor receives payload
-    {model_tier, messages,              → resolve backend from config
-     role, working_dir,                 → resolve model from tier
-     interactive: false, ...}           → build tools for role
-                                        → route to LLM call
-  ← streams action_output             ← streams tokens/lines
-  ← receives action_complete         ← sends final result text
-  → processes result                    → execution done, slot freed
-    (parse verdict, git ops, etc.)
-```
-
-**Interactive** (e.g., feature engineering with user feedback):
+**Non-interactive `prompt` action** (covers 9 of 11 server actions):
 
 ```
 pyre_lib (server)                    pyre_client (worker)
 ─────────────────                    ────────────────────
 Flow.run_action()
-  → dispatch execute_prompt          → Executor receives payload
-    {interactive: true, ...}            → run initial LLM call
+  → dispatch {action: "prompt"}      → Executor receives payload
+    {model_tier, messages,              → Actions.resolve("prompt")
+     role, working_dir,                 → Actions.Prompt.execute()
+     interactive: false, ...}             → resolve backend, model, tools
+                                          → route to LLM call
+  ← streams action_output               ← streams tokens/lines
+  ← receives action_complete           ← sends final result text
+  → interprets result                     → execution done, slot freed
+    (parse verdict if QAReviewer)
+```
+
+**Non-interactive `git_pr_setup` action** (similar for `git_ship`, `git_review`):
+
+```
+pyre_lib (server)                    pyre_client (worker)
+─────────────────                    ────────────────────
+Flow.run_action()
+  → dispatch {action: "git_pr_setup"}  → Executor receives payload
+    {messages, github creds,              → Actions.resolve("git_pr_setup")
+     working_dir, ...}                    → Actions.GitPRSetup.execute()
+                                            → LLM call (persona: shipper)
+  ← streams action_output                 ← streams tokens
+                                            → parse shipping plan from text
+                                            → edit .gitignore
+                                            → git checkout -b, add, commit, push
+                                            → GitHub: create draft PR
+  ← receives action_complete             ← sends {text, branch_name, pr_url, pr_number}
+  → stores result in flow state             → execution done, slot freed
+```
+
+**Interactive action** (any type — `prompt`, `git_pr_setup`, etc.):
+
+```
+pyre_lib (server)                    pyre_client (worker)
+─────────────────                    ────────────────────
+Flow.run_action()
+  → dispatch {action: "prompt",      → Executor receives payload
+     interactive: true, ...}            → Action module runs LLM call
   ← streams action_output             ← streams tokens/lines
   ← receives action_result            ← sends result (NOT complete)
                                         → blocks waiting...
@@ -139,12 +165,14 @@ Flow.run_action()
   ← receives action_result            ← sends new result, blocks again
 
   user says continue (no replies) →
-  → sends action_finish                → sends action_complete
+  → sends action_finish                → runs post-LLM processing
+                                          (git ops, GitHub, etc. if needed)
+                                        → sends action_complete
                                         → execution exits, slot freed
-  → processes final result
+  → interprets final result
 ```
 
-The worker handles the full LLM interaction including tool execution. The orchestration layer processes the text result (parsing, git operations, artifact writing, GitHub API calls). During interactive stages, both server and client block — the server's flow Task blocks on `await_user_action_fn`, and the client's execution process blocks in `interactive_loop`, maintaining working directory and file state consistency.
+The worker handles the full action lifecycle: LLM calls, response parsing, git operations, and GitHub API interactions. The server interprets the structured result (e.g., extracts `verdict` from QAReviewer for flow branching). During interactive stages, both server and client block — the server's flow Task blocks on `await_user_action_fn`, and the client's execution process blocks in `interactive_loop`, maintaining working directory and file state consistency. Post-LLM processing runs after the interactive loop completes.
 
 ## Key Design Decisions
 
@@ -160,13 +188,15 @@ The worker handles the full LLM interaction including tool execution. The orches
 
 6. **`manages_tool_loop?` routing** — The Executor mirrors `Helpers.call_llm/4`'s routing: CLI backends handle tools internally, ReqLLM uses AgenticLoop.
 
-7. **Thin client** — No knowledge of workflows, stages, or orchestration. Receives individual actions, executes them, streams output back.
+7. **Client owns action lifecycle** — The server sends named action types (`prompt`, `git_pr_setup`, `git_ship`, `git_review`) with data parameters. The client has hardcoded implementations for each type. The server never sends shell commands or arbitrary code. This is driven by a security constraint: if the server could send commands over WebSocket, anyone with WebSocket access could compromise the client machine. The client is rich in capability (LLM backends, git operations, GitHub API) but thin in architecture (no workflows, no flow state, no orchestration).
 
-8. **WebSockex + Phoenix V2 protocol** — OTP-compatible WebSocket client speaking the channel wire format directly.
+8. **4 action types cover all current needs** — `prompt` handles 9 of 11 server-side actions (the 8 templates + QAReviewer). `git_pr_setup`, `git_ship`, and `git_review` handle the 3 side-effect outliers. New action types are rare and require lockstep updates to both libraries.
 
-9. **Library, not application** — No auto-start. Host app configures and starts processes.
+9. **WebSockex + Phoenix V2 protocol** — OTP-compatible WebSocket client speaking the channel wire format directly.
 
-10. **Capacity hardcoded to 1** — `max_capacity` is 1 for now. Dynamic capacity negotiation (notifying the server when slots free up, rejecting over-capacity dispatches) is deferred. Infrastructure for future concurrency stays in place.
+10. **Library, not application** — No auto-start. Host app configures and starts processes.
+
+11. **Capacity hardcoded to 1** — `max_capacity` is 1 for now. Dynamic capacity negotiation (notifying the server when slots free up, rejecting over-capacity dispatches) is deferred. Infrastructure for future concurrency stays in place.
 
 ## Stages
 
@@ -197,7 +227,7 @@ When pyre_client is built, pyre_lib will need these changes (done separately):
 
 1. **Add `pyre_client` as optional dev dependency** — only for tests that need the mock backend
 2. **Remove execution modules** — `Pyre.LLM`, `Pyre.LLM.*`, `Pyre.Tools`, `Pyre.Tools.AgenticLoop`, `Pyre.Session`, `Pyre.Session.Registry`
-3. **Refactor actions** — Replace `Helpers.call_llm/4` with remote dispatch to workers via WebSocket (synchronous dispatch-and-wait: PubSub subscribe → broadcast to worker → block until `action_result` or `action_complete`)
+3. **Refactor actions** — Template actions (8 of 11) become dispatch descriptors: they build payloads and dispatch `"prompt"` to workers. QAReviewer dispatches `"prompt"` and parses the verdict from the returned text server-side. The 3 outlier actions (PRSetup, Shipper, PRReviewer) dispatch their named types (`"git_pr_setup"`, `"git_ship"`, `"git_review"`) and interpret the structured results. Replace `Helpers.call_llm/4` with synchronous dispatch-and-wait: PubSub subscribe → broadcast to worker → block until `action_result` or `action_complete`
 4. **Refactor interactive loops** — Server sends `action_continue` with user's reply message to the blocked worker; sends `action_finish` when the interactive loop ends. The flow Task blocks on `await_user_action_fn` as it does today — the only change is that the LLM call happens remotely instead of locally
 5. **Add new channel events** — `PyreWeb.Channel` needs:
    - `handle_in("action_result", ...)` — intermediate result from interactive execution (broadcasts to PubSub like `action_output`)

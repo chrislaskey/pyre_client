@@ -1,20 +1,23 @@
-# Stage 6 — Executor
+# Stage 6 — Executor and Action Modules
 
 ## Overview
 
-`PyreClient.Executor` receives action dispatches from the Channel, executes LLM prompts locally via the `PyreClient.LLM` backend system, streams output back, and reports completion.
+`PyreClient.Executor` receives action dispatches from the Channel, routes them to the appropriate action module, manages capacity, and handles the interactive loop. Action modules own the full execution lifecycle for their action type.
 
-The Executor resolves the backend from the client's own config (`PyreClient.LLM.Config.default_backend/0`), resolves the model tier to a concrete model string, routes through the appropriate execution path (direct chat, AgenticLoop, stream, or generate), and streams results back to the server. The server does NOT specify which backend to use — it only sends the `model_tier`.
+The server sends **named action types** with data parameters. The client has hardcoded implementations for each type. The server never sends shell commands or arbitrary code — the client decides what to execute based on its action modules. This is a security requirement: if the server could send commands over WebSocket, anyone with WebSocket access could compromise the client machine.
 
-The Executor has **no knowledge of workflows, stages, or orchestration**. It executes individual actions the server tells it to.
-
-**Note:** pyre_native (Swift) currently has a proof-of-concept for arbitrary shell command execution (`RemoteCommandService`). pyre_client does NOT implement that — it focuses exclusively on LLM prompt execution. Shell commands that LLM agents need are handled by the LLM backends themselves (e.g., Claude CLI's built-in Bash tool, or Pyre's `run_command` tool via the AgenticLoop).
+The Executor has **no knowledge of workflows, stages, or orchestration**. It executes individual actions when triggered.
 
 ## Action Types
 
-| Type | Payload | What it does |
-|------|---------|-------------|
-| `execute_prompt` | `%{"messages" => [...], "model_tier" => "standard", ...}` | Call an LLM backend with optional tool execution. The client resolves the backend locally from its own config — the server does NOT specify which backend to use. |
+| Type | Client Module | What it does |
+|------|---------------|-------------|
+| `prompt` | `PyreClient.Actions.Prompt` | Call an LLM backend with optional tool execution. Return text. Covers 9 of 11 server-side actions. |
+| `git_pr_setup` | `PyreClient.Actions.GitPRSetup` | LLM call → parse shipping plan → edit .gitignore → git checkout/add/commit/push → create draft GitHub PR. Return text + branch + PR info. |
+| `git_ship` | `PyreClient.Actions.GitShip` | LLM call → parse shipping plan → git checkout/add/commit/push → create GitHub PR (non-draft). Return text + shipping summary. |
+| `git_review` | `PyreClient.Actions.GitReview` | LLM call → parse verdict → git add/commit/push (fire-and-forget) → post GitHub PR comment → maybe mark ready-for-review. Return text + verdict. |
+
+All action types share the same LLM infrastructure (backend resolution, model tier mapping, tool building, streaming). The git action types add post-LLM processing: response parsing, git operations, and GitHub API calls.
 
 ## Channel Events
 
@@ -22,27 +25,27 @@ The Executor has **no knowledge of workflows, stages, or orchestration**. It exe
 
 | Event | When | Payload |
 |-------|------|---------|
-| `action_output` | Streaming token/line during execution | `%{"execution_id" => id, "line" => text}` |
+| `action_output` | Streaming token/line during execution | `%{"execution_id" => id, "content" => text}` |
 | `action_result` | LLM call finished, interactive stage awaiting continuation | `%{"execution_id" => id, "result_text" => text}` |
-| `action_complete` | Execution fully done, capacity slot freed | `%{"execution_id" => id, "status" => "ok" | "error", "result_text" => text}` |
+| `action_complete` | Execution fully done, capacity slot freed | `%{"execution_id" => id, "status" => "ok" | "error", "result" => result_map}` |
 
 ### Server → Client
 
 | Event | When | Payload |
 |-------|------|---------|
-| `action` | Dispatch new action to worker | `%{"execution_id" => id, "type" => "execute_prompt", "payload" => {...}}` |
+| `action` | Dispatch new action to worker | `%{"execution_id" => id, "action" => "prompt", "payload" => {...}}` |
 | `action_continue` | User replied during interactive stage | `%{"execution_id" => id, "message" => text}` |
 | `action_finish` | Interactive loop done, release the worker | `%{"execution_id" => id}` |
 
 The distinction between `action_result` and `action_complete` is key:
 - **`action_result`**: The LLM call is done but the execution stays alive. The capacity slot remains occupied. The spawned process blocks waiting for `action_continue` or `action_finish`.
-- **`action_complete`**: The execution is fully done. The capacity slot is freed.
+- **`action_complete`**: The execution is fully done. The capacity slot is freed. The `result` field contains action-specific structured data (e.g., `%{"text" => "..."}` for prompt, `%{"text" => "...", "branch_name" => "...", "pr_url" => "..."}` for git_pr_setup).
 
 Non-interactive executions skip `action_result` entirely and go straight to `action_complete`.
 
 ## Execution Flow
 
-### Non-interactive (standard)
+### Non-interactive (any action type)
 
 ```
 Server pushes "action" event
@@ -50,25 +53,22 @@ Server pushes "action" event
   ▼
 Channel.handle_message → Executor.handle_action/1
   │
-  ├─ 1. Resolve backend, model, and tools
-  │    ├─ Resolve backend from client's own config (PyreClient.LLM.Config.default_backend/0)
-  │    ├─ Resolve model tier → model string (PyreClient.LLM.Config.resolve_model/2)
-  │    ├─ Build tools locally if role provided (PyreClient.Tools.for_role/3)
+  ├─ 1. Route by action type
+  │    Actions.resolve(payload["action"])
+  │    → {:ok, PyreClient.Actions.Prompt}
   │
-  ├─ 2. Route by backend capability
-  │    ├─ tools + manages_tool_loop? → backend.chat/4 (CLI handles tools)
-  │    ├─ tools + !manages_tool_loop? → AgenticLoop (ReqLLM multi-turn)
-  │    ├─ streaming → backend.stream/3
-  │    └─ else → backend.generate/3
-  │    Stream tokens → send "action_output"
-  │    Collect final result
+  ├─ 2. Spawn execution process
+  │    action_module.execute(execution_id, payload, context)
+  │      ├─ Resolve backend, model, tools (shared LLM infrastructure)
+  │      ├─ Call LLM → stream "action_output"
+  │      └─ Post-LLM processing (git, GitHub, etc. for git actions)
   │
   └─ 3. Send "action_complete"
        ├─ status ("ok" or "error")
-       └─ result_text
+       └─ result (action-specific map)
 ```
 
-### Interactive (blocking wait for user input)
+### Interactive (any action type)
 
 ```
 Server pushes "action" event (interactive: true)
@@ -76,7 +76,7 @@ Server pushes "action" event (interactive: true)
   ▼
 Executor.handle_action/1 → spawns execution process
   │
-  ├─ 1. Run initial LLM call (same routing as non-interactive)
+  ├─ 1. Action module runs initial LLM call
   │    ├─ Stream tokens → "action_output"
   │    └─ Collect result text
   │
@@ -95,22 +95,575 @@ Executor.handle_action/1 → spawns execution process
   │    │
   │    └─ Server sends "action_finish"
   │         ├─ Channel routes to Executor.handle_finish/1
-  │         ├─ Executor signals execution process to exit
+  │         ├─ Executor signals execution process
+  │         ├─ Action module runs post-LLM processing (git, GitHub, etc.)
   │         └─ Execution process sends "action_complete" and exits
   │
   └─ 4. Capacity slot freed on "action_complete"
 ```
 
-## Module: `PyreClient.Executor`
+The interactive loop is always about the LLM portion. Post-LLM processing runs after the interactive loop completes (`action_finish` received). From the client's perspective, `action_continue` is always "resume the LLM session with this message" — whether it's a user reply or a finalize prompt. The server distinguishes between the two; the client doesn't need to.
+
+---
+
+## Module: `PyreClient.Actions` — Behaviour + Registry
+
+```elixir
+defmodule PyreClient.Actions do
+  @moduledoc """
+  Action behaviour and routing registry.
+
+  Each action type has a dedicated module that implements the full
+  execution lifecycle. The Executor routes to the correct module
+  via `resolve/1`.
+
+  ## Security Model
+
+  The server sends named action types with data parameters — never
+  shell commands or arbitrary code. Each action module is a hardcoded
+  implementation that decides what to execute locally. This ensures
+  the client machine cannot be compromised via WebSocket access.
+  """
+
+  @type execution_context :: %{
+    execution_id: String.t(),
+    backend: module(),
+    model: String.t(),
+    tools: [ReqLLM.Tool.t()],
+    opts: keyword(),
+    output_fn: (String.t() -> :ok),
+    send_to_server: (String.t(), map() -> :ok),
+    interactive?: boolean()
+  }
+
+  @doc """
+  Execute the action. Returns `{:ok, result_map}` or `{:error, reason}`.
+
+  The `result_map` is action-specific:
+  - `prompt`: `%{"text" => "..."}`
+  - `git_pr_setup`: `%{"text" => "...", "branch_name" => "...", "pr_url" => "...", "pr_number" => 42}`
+  - `git_ship`: `%{"text" => "...", "shipping_summary" => "..."}`
+  - `git_review`: `%{"text" => "...", "verdict" => "approve" | "reject"}`
+  """
+  @callback execute(payload :: map(), context :: execution_context()) ::
+              {:ok, map()} | {:error, term()}
+
+  # --- Routing Registry ---
+
+  @doc "Resolve an action type string to its implementation module."
+  @spec resolve(String.t()) :: {:ok, module()} | :error
+  def resolve("prompt"), do: {:ok, PyreClient.Actions.Prompt}
+  def resolve("git_pr_setup"), do: {:ok, PyreClient.Actions.GitPRSetup}
+  def resolve("git_ship"), do: {:ok, PyreClient.Actions.GitShip}
+  def resolve("git_review"), do: {:ok, PyreClient.Actions.GitReview}
+  def resolve(_), do: :error
+end
+```
+
+---
+
+## Module: `PyreClient.Actions.Prompt`
+
+Handles the `prompt` action type — a generic LLM call that covers 9 of 11 server-side actions. The server builds the messages (with persona, artifacts, etc.) and sends them; the client calls the LLM and returns text.
+
+```elixir
+defmodule PyreClient.Actions.Prompt do
+  @moduledoc """
+  Generic LLM prompt execution.
+
+  Covers: ProductManager, Designer, SoftwareArchitect, Programmer,
+  TestWriter, SoftwareEngineer, PrototypeEngineer, Generalist, QAReviewer.
+
+  For QAReviewer, the server parses the verdict from the returned text.
+  """
+
+  @behaviour PyreClient.Actions
+
+  require Logger
+
+  @impl true
+  def execute(payload, context) do
+    Logger.info("[Actions.Prompt] #{context.execution_id}: executing via #{inspect(context.backend)}")
+
+    result = call_llm(context)
+
+    case result do
+      {:ok, text} -> {:ok, %{"text" => text}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp call_llm(context) do
+    PyreClient.Actions.LLM.call(context)
+  end
+end
+```
+
+---
+
+## Module: `PyreClient.Actions.GitPRSetup`
+
+Handles the `git_pr_setup` action type — LLM call followed by git operations and draft GitHub PR creation. Used by the PRSetup action in the Feature flow.
+
+```elixir
+defmodule PyreClient.Actions.GitPRSetup do
+  @moduledoc """
+  LLM → parse shipping plan → edit .gitignore → git → draft GitHub PR.
+
+  Error policy: fail on any git error.
+  """
+
+  @behaviour PyreClient.Actions
+
+  alias PyreClient.Actions.{Git, GitHub}
+
+  require Logger
+
+  @impl true
+  def execute(payload, context) do
+    inner = payload["payload"] || %{}
+    working_dir = inner["working_dir"]
+    github_config = inner["github"]
+
+    Logger.info("[Actions.GitPRSetup] #{context.execution_id}: starting")
+
+    with {:ok, text} <- PyreClient.Actions.LLM.call(context),
+         {:ok, plan} <- Git.parse_shipping_plan(text),
+         :ok <- Git.edit_gitignore(working_dir),
+         {:ok, _branch} <- Git.checkout_or_create_branch(plan.branch_name, working_dir),
+         :ok <- Git.add_all(working_dir),
+         :ok <- Git.commit(plan.commit_message, working_dir),
+         :ok <- Git.push(plan.branch_name, working_dir),
+         {:ok, pr} <- GitHub.create_pull_request(github_config, plan, draft: true) do
+      {:ok, %{
+        "text" => text,
+        "branch_name" => plan.branch_name,
+        "pr_url" => pr.url,
+        "pr_number" => pr.number
+      }}
+    else
+      {:error, reason} ->
+        Logger.error("[Actions.GitPRSetup] #{context.execution_id}: failed: #{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+end
+```
+
+---
+
+## Module: `PyreClient.Actions.GitShip`
+
+Handles the `git_ship` action type — LLM call (conditionally with tools) followed by git operations and GitHub PR creation (non-draft). Used by the Shipper action in the OvernightFeature flow.
+
+```elixir
+defmodule PyreClient.Actions.GitShip do
+  @moduledoc """
+  LLM → parse shipping plan → git → GitHub PR (non-draft).
+
+  Error policy: fail on any git error.
+  """
+
+  @behaviour PyreClient.Actions
+
+  alias PyreClient.Actions.{Git, GitHub}
+
+  require Logger
+
+  @impl true
+  def execute(payload, context) do
+    inner = payload["payload"] || %{}
+    working_dir = inner["working_dir"]
+    github_config = inner["github"]
+
+    Logger.info("[Actions.GitShip] #{context.execution_id}: starting")
+
+    with {:ok, text} <- PyreClient.Actions.LLM.call(context),
+         {:ok, plan} <- Git.parse_shipping_plan(text),
+         {:ok, _branch} <- Git.checkout_branch(plan.branch_name, working_dir),
+         :ok <- Git.add_all(working_dir),
+         :ok <- Git.commit(plan.commit_message, working_dir),
+         :ok <- Git.push(plan.branch_name, working_dir),
+         {:ok, _pr} <- GitHub.create_pull_request(github_config, plan, draft: false) do
+      {:ok, %{
+        "text" => text,
+        "shipping_summary" => "Branch: #{plan.branch_name}, PR: #{plan.pr_title}"
+      }}
+    else
+      {:error, reason} ->
+        Logger.error("[Actions.GitShip] #{context.execution_id}: failed: #{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+end
+```
+
+---
+
+## Module: `PyreClient.Actions.GitReview`
+
+Handles the `git_review` action type — LLM call, verdict parsing, then fire-and-forget git/GitHub operations. Used by the PRReviewer action in the CodeReview flow.
+
+```elixir
+defmodule PyreClient.Actions.GitReview do
+  @moduledoc """
+  LLM → parse verdict → git (fire-and-forget) → GitHub comment.
+
+  Error policy: git/GitHub are fire-and-forget; action succeeds if LLM succeeds.
+  If approved, also marks the PR as ready for review.
+  """
+
+  @behaviour PyreClient.Actions
+
+  alias PyreClient.Actions.{Git, GitHub}
+
+  require Logger
+
+  @impl true
+  def execute(payload, context) do
+    inner = payload["payload"] || %{}
+    working_dir = inner["working_dir"]
+    pr_number = inner["pr_number"]
+    github_config = inner["github"]
+
+    Logger.info("[Actions.GitReview] #{context.execution_id}: starting")
+
+    case PyreClient.Actions.LLM.call(context) do
+      {:ok, text} ->
+        verdict = Git.parse_verdict(text)
+
+        # Git operations — fire and forget
+        try do
+          Git.add_all(working_dir)
+          Git.commit("Code review changes", working_dir)
+          Git.push_current_branch(working_dir)
+        rescue
+          e -> Logger.warning("[Actions.GitReview] Git ops failed (non-fatal): #{inspect(e)}")
+        end
+
+        # GitHub operations — fire and forget
+        if github_config do
+          try do
+            GitHub.create_comment(github_config, pr_number, text)
+
+            if verdict == "approve" do
+              GitHub.mark_ready_for_review(github_config, pr_number)
+            end
+          rescue
+            e -> Logger.warning("[Actions.GitReview] GitHub ops failed (non-fatal): #{inspect(e)}")
+          end
+        end
+
+        {:ok, %{"text" => text, "verdict" => verdict}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+end
+```
+
+---
+
+## Module: `PyreClient.Actions.LLM` — Shared LLM Infrastructure
+
+All action modules use this shared module for LLM calls. It encapsulates backend resolution, model tier mapping, tool building, and the `manages_tool_loop?` routing logic.
+
+```elixir
+defmodule PyreClient.Actions.LLM do
+  @moduledoc """
+  Shared LLM calling infrastructure for action modules.
+
+  Routes based on backend capability (mirrors pyre_lib's Helpers.call_llm/4):
+  - CLI backends (manages_tool_loop? = true): direct chat/4
+  - ReqLLM (manages_tool_loop? = false): AgenticLoop
+  - No tools + streaming: stream/3
+  - No tools + no streaming: generate/3
+  """
+
+  @doc "Execute an LLM call using the context. Returns {:ok, text} or {:error, reason}."
+  def call(%{backend: backend, model: model, tools: tools, opts: opts, output_fn: output_fn} = _context) do
+    result =
+      cond do
+        tools != [] and manages_tool_loop?(backend) ->
+          backend.chat(model, context_messages(opts), tools, Keyword.put(opts, :output_fn, output_fn))
+
+        tools != [] ->
+          log_fn = fn msg -> output_fn.(msg <> "\n") end
+          PyreClient.Tools.AgenticLoop.run(backend, model, context_messages(opts), tools,
+            streaming: Keyword.get(opts, :streaming, false),
+            output_fn: output_fn,
+            log_fn: log_fn,
+            verbose: Keyword.get(opts, :verbose, false)
+          )
+
+        Keyword.get(opts, :streaming, true) ->
+          backend.stream(model, context_messages(opts), Keyword.put(opts, :output_fn, output_fn))
+
+        true ->
+          backend.generate(model, context_messages(opts), opts)
+      end
+
+    case result do
+      {:ok, text} when is_binary(text) -> {:ok, text}
+      {:ok, response} when is_map(response) -> {:ok, extract_text(response)}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp context_messages(opts), do: Keyword.get(opts, :messages, [])
+  defp manages_tool_loop?(backend) do
+    function_exported?(backend, :manages_tool_loop?, 0) and backend.manages_tool_loop?()
+  end
+  defp extract_text(response), do: inspect(response)
+end
+```
+
+---
+
+## Module: `PyreClient.Actions.Git` — Shared Git Utilities
+
+Extracted from pyre_lib's `Pyre.Actions.Shipper` and `Pyre.Actions.QAReviewer`. Provides git operations and response parsing used by all three git action types.
+
+```elixir
+defmodule PyreClient.Actions.Git do
+  @moduledoc """
+  Shared git operations and LLM response parsing for git action types.
+  """
+
+  require Logger
+
+  # --- Response Parsing ---
+
+  @doc """
+  Parse a shipping plan from LLM response text.
+
+  Extracts: branch_name, commit_message, pr_title, pr_body.
+  Returns {:ok, plan} or {:error, :parse_failed}.
+  """
+  def parse_shipping_plan(text) do
+    # Implementation adapted from Pyre.Actions.Shipper.parse_shipping_plan/1
+    # Scans LLM response for structured fields
+    with {:ok, branch} <- extract_field(text, "branch_name"),
+         {:ok, commit_msg} <- extract_field(text, "commit_message"),
+         {:ok, pr_title} <- extract_field(text, "pr_title"),
+         {:ok, pr_body} <- extract_field(text, "pr_body") do
+      {:ok, %{
+        branch_name: branch,
+        commit_message: commit_msg,
+        pr_title: pr_title,
+        pr_body: pr_body
+      }}
+    else
+      _ -> {:error, :parse_failed}
+    end
+  end
+
+  @doc """
+  Parse an APPROVE/REJECT verdict from LLM review text.
+
+  Returns "approve", "reject", or "unknown".
+  """
+  def parse_verdict(text) do
+    # Implementation adapted from Pyre.Actions.QAReviewer.parse_verdict/1
+    text
+    |> String.split("\n")
+    |> Enum.reduce("unknown", fn line, acc ->
+      cond do
+        String.contains?(String.upcase(line), "APPROVE") -> "approve"
+        String.contains?(String.upcase(line), "REJECT") -> "reject"
+        true -> acc
+      end
+    end)
+  end
+
+  # --- Git Operations ---
+
+  def edit_gitignore(working_dir) do
+    gitignore_path = Path.join(working_dir, ".gitignore")
+
+    if File.exists?(gitignore_path) do
+      content = File.read!(gitignore_path)
+      updated =
+        content
+        |> String.split("\n")
+        |> Enum.reject(&String.contains?(&1, "priv/pyre/features/"))
+        |> Enum.reject(&String.contains?(&1, "priv/pyre/runs/"))
+        |> Enum.join("\n")
+      File.write!(gitignore_path, updated)
+    end
+
+    :ok
+  end
+
+  def checkout_or_create_branch(branch_name, working_dir) do
+    case run_git(["checkout", "-b", branch_name], working_dir) do
+      :ok -> {:ok, branch_name}
+      {:error, _} ->
+        # Branch already exists, switch to it
+        case run_git(["checkout", branch_name], working_dir) do
+          :ok -> {:ok, branch_name}
+          error -> error
+        end
+    end
+  end
+
+  def checkout_branch(branch_name, working_dir) do
+    case run_git(["checkout", "-b", branch_name], working_dir) do
+      :ok -> {:ok, branch_name}
+      error -> error
+    end
+  end
+
+  def add_all(working_dir) do
+    run_git(["add", "-A"], working_dir)
+  end
+
+  def commit(message, working_dir) do
+    case run_git(["commit", "-m", message], working_dir) do
+      :ok -> :ok
+      {:error, output} ->
+        if String.contains?(to_string(output), "nothing to commit") do
+          :ok
+        else
+          {:error, output}
+        end
+    end
+  end
+
+  def push(branch_name, working_dir) do
+    run_git(["push", "-u", "origin", branch_name], working_dir)
+  end
+
+  def push_current_branch(working_dir) do
+    case run_git(["rev-parse", "--abbrev-ref", "HEAD"], working_dir) do
+      {:ok, branch} -> run_git(["push", "origin", String.trim(branch)], working_dir)
+      error -> error
+    end
+  end
+
+  # --- Helpers ---
+
+  defp run_git(args, working_dir) do
+    case System.cmd("git", args, cd: working_dir, stderr_to_stdout: true) do
+      {_output, 0} -> :ok
+      {output, _code} -> {:error, output}
+    end
+  end
+
+  defp extract_field(text, field_name) do
+    # Simple regex extraction — adapted from Shipper's parsing logic
+    case Regex.run(~r/#{field_name}:\s*(.+)/i, text) do
+      [_, value] -> {:ok, String.trim(value)}
+      _ -> {:error, "#{field_name} not found"}
+    end
+  end
+end
+```
+
+---
+
+## Module: `PyreClient.Actions.GitHub` — Lightweight GitHub API Client
+
+Uses `req` (already a transitive dep via `req_llm`) for 3 HTTP endpoints. The server sends a short-lived GitHub installation token per-request in the `github` field of the action payload.
+
+```elixir
+defmodule PyreClient.Actions.GitHub do
+  @moduledoc """
+  Lightweight GitHub API client for git action types.
+
+  Uses short-lived installation tokens provided per-request by the server.
+  Three endpoints: create PR, create comment, mark ready for review.
+  """
+
+  require Logger
+
+  @github_api "https://api.github.com"
+
+  @doc "Create a pull request. Returns {:ok, %{url: url, number: number}} or {:error, reason}."
+  def create_pull_request(github_config, plan, opts \\ []) do
+    %{"owner" => owner, "repo" => repo, "token" => token} = github_config
+    draft = Keyword.get(opts, :draft, false)
+
+    body = %{
+      title: plan.pr_title,
+      body: plan.pr_body,
+      head: plan.branch_name,
+      base: "main",
+      draft: draft
+    }
+
+    case github_request(:post, "/repos/#{owner}/#{repo}/pulls", body, token) do
+      {:ok, %{status: status, body: resp}} when status in [200, 201] ->
+        {:ok, %{url: resp["html_url"], number: resp["number"]}}
+      {:ok, %{status: status, body: resp}} ->
+        {:error, "GitHub API #{status}: #{inspect(resp)}"}
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc "Post a comment on a PR."
+  def create_comment(github_config, pr_number, body_text) do
+    %{"owner" => owner, "repo" => repo, "token" => token} = github_config
+    body = %{body: body_text}
+
+    case github_request(:post, "/repos/#{owner}/#{repo}/issues/#{pr_number}/comments", body, token) do
+      {:ok, %{status: status}} when status in [200, 201] -> :ok
+      {:ok, %{status: status, body: resp}} -> {:error, "GitHub API #{status}: #{inspect(resp)}"}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc "Mark a PR as ready for review (remove draft status)."
+  def mark_ready_for_review(github_config, pr_number) do
+    %{"owner" => owner, "repo" => repo, "token" => token} = github_config
+
+    # This uses the GraphQL API (REST doesn't support removing draft status)
+    query = """
+    mutation {
+      markPullRequestReadyForReview(input: {pullRequestId: "#{pr_number}"}) {
+        pullRequest { number }
+      }
+    }
+    """
+
+    case github_request(:post, "/graphql", %{query: query}, token) do
+      {:ok, %{status: 200}} -> :ok
+      {:ok, %{status: status, body: resp}} -> {:error, "GitHub GraphQL #{status}: #{inspect(resp)}"}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp github_request(method, path, body, token) do
+    Req.request(
+      method: method,
+      url: @github_api <> path,
+      json: body,
+      headers: [
+        {"authorization", "Bearer #{token}"},
+        {"accept", "application/vnd.github+json"},
+        {"x-github-api-version", "2022-11-28"}
+      ]
+    )
+  end
+end
+```
+
+---
+
+## Module: `PyreClient.Executor` — Updated
+
+The Executor GenServer is unchanged in structure. The key change: `execute/3` routes through `PyreClient.Actions.resolve/1` instead of pattern-matching on `"execute_prompt"`. The interactive loop remains shared infrastructure in the Executor.
 
 ```elixir
 defmodule PyreClient.Executor do
   @moduledoc """
-  Executes LLM prompt actions dispatched by the Pyre Web server.
+  Receives action dispatches, routes to action modules, manages capacity.
 
-  Routes LLM calls based on backend capability:
-  - CLI backends (manages_tool_loop? = true): direct chat/4
-  - ReqLLM (manages_tool_loop? = false): PyreClient.Tools.AgenticLoop
+  Routes actions through `PyreClient.Actions.resolve/1` to the appropriate
+  implementation module. Handles the interactive loop (action_continue /
+  action_finish) as shared infrastructure for all action types.
 
   Has no knowledge of workflows, stages, or orchestration.
   """
@@ -123,7 +676,7 @@ defmodule PyreClient.Executor do
 
   defstruct [
     :max_capacity,
-    :active_executions  # %{execution_id => pid}  (pid of the spawned execution process)
+    :active_executions  # %{execution_id => pid}
   ]
 
   @execution_timeout 86_400_000  # 24 hours — matches workflow-level timeout
@@ -180,7 +733,7 @@ defmodule PyreClient.Executor do
   @impl true
   def handle_cast({:handle_action, payload}, state) do
     execution_id = payload["execution_id"]
-    action_type = payload["type"]
+    action_type = payload["action"]
 
     if has_capacity?(state) do
       pid = spawn_execution(execution_id, action_type, payload)
@@ -195,11 +748,6 @@ defmodule PyreClient.Executor do
   end
 
   def handle_cast(:on_disconnected, state) do
-    # Channel drops are expected — don't kill in-flight work.
-    # The Connection will reconnect and rejoin automatically.
-    # In-flight executions continue; output sent during disconnection
-    # may be lost, but the final action_complete will be sent after
-    # reconnection if the execution finishes while disconnected.
     Logger.warning("[PyreClient.Executor] Disconnected, #{map_size(state.active_executions)} executions still running")
     {:noreply, state}
   end
@@ -271,9 +819,121 @@ defmodule PyreClient.Executor do
     pid
   end
 
-  # --- Action: execute_prompt ---
+  defp execute(execution_id, action_type, payload) do
+    case PyreClient.Actions.resolve(action_type) do
+      {:ok, action_module} ->
+        context = build_context(execution_id, payload)
 
-  defp execute(execution_id, "execute_prompt", payload) do
+        # Phase 1: LLM call (+ interactive loop if interactive)
+        llm_result =
+          if context.interactive? do
+            execute_interactive(execution_id, context)
+          else
+            PyreClient.Actions.LLM.call(context)
+          end
+
+        # Phase 2: Action module processes the LLM result
+        case llm_result do
+          {:ok, _text} ->
+            # Put the LLM result text into context for the action module
+            context = Map.put(context, :llm_result_text, elem(llm_result, 1))
+
+            case action_module.execute(payload, context) do
+              {:ok, result} ->
+                send_to_server("action_complete", %{
+                  "execution_id" => execution_id,
+                  "status" => "ok",
+                  "result" => result
+                })
+
+              {:error, reason} ->
+                Logger.error("[PyreClient.Executor] #{execution_id}: action error: #{inspect(reason)}")
+                send_to_server("action_complete", %{
+                  "execution_id" => execution_id,
+                  "status" => "error",
+                  "result" => %{"error" => inspect(reason)}
+                })
+            end
+
+          {:error, reason} ->
+            Logger.error("[PyreClient.Executor] #{execution_id}: LLM error: #{inspect(reason)}")
+            send_to_server("action_complete", %{
+              "execution_id" => execution_id,
+              "status" => "error",
+              "result" => %{"error" => inspect(reason)}
+            })
+        end
+
+      :error ->
+        Logger.warning("[PyreClient.Executor] #{execution_id}: unknown action type: #{action_type}")
+        send_to_server("action_complete", %{
+          "execution_id" => execution_id,
+          "status" => "error",
+          "result" => %{"error" => "Unknown action type: #{action_type}"}
+        })
+    end
+  end
+
+  # --- Interactive Loop ---
+
+  defp execute_interactive(execution_id, context) do
+    # Run initial LLM call
+    case PyreClient.Actions.LLM.call(context) do
+      {:ok, text} ->
+        send_to_server("action_result", %{
+          "execution_id" => execution_id,
+          "result_text" => text
+        })
+
+        interactive_loop(execution_id, context, text)
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp interactive_loop(execution_id, context, last_text) do
+    receive do
+      {:continue, payload} ->
+        user_message = payload["message"] || ""
+        session_id = Keyword.get(context.opts, :session_id)
+
+        Logger.info("[PyreClient.Executor] #{execution_id}: interactive continue (session: #{session_id})")
+
+        messages = [%{role: :user, content: user_message}]
+        resume_opts = Keyword.put(context.opts, :resume, session_id)
+        resume_opts = Keyword.put(resume_opts, :output_fn, context.output_fn)
+        resume_opts = Keyword.put(resume_opts, :messages, messages)
+        resume_context = %{context | opts: resume_opts}
+
+        case PyreClient.Actions.LLM.call(resume_context) do
+          {:ok, text} ->
+            send_to_server("action_result", %{
+              "execution_id" => execution_id,
+              "result_text" => text
+            })
+
+            interactive_loop(execution_id, context, text)
+
+          {:error, reason} ->
+            Logger.error("[PyreClient.Executor] #{execution_id}: interactive LLM error: #{inspect(reason)}")
+            {:error, reason}
+        end
+
+      :finish ->
+        Logger.info("[PyreClient.Executor] #{execution_id}: interactive finished")
+        {:ok, last_text}
+
+    after
+      @execution_timeout ->
+        Logger.error("[PyreClient.Executor] #{execution_id}: interactive loop timed out")
+        {:error, :interactive_timeout}
+    end
+  end
+
+  # --- Context Building ---
+
+  defp build_context(execution_id, payload) do
     inner = payload["payload"] || %{}
     model_tier = inner["model_tier"] || "standard"
     messages = inner["messages"] || []
@@ -282,186 +942,35 @@ defmodule PyreClient.Executor do
     allowed_paths = inner["allowed_paths"] || []
     allowed_commands = inner["allowed_commands"]
     opts_map = inner["opts"] || %{}
+    interactive? = inner["interactive"] == true
 
-    # Backend is determined entirely by the client's own config — the server
-    # sends only the model_tier. The client resolves both the backend and
-    # the concrete model string from its local configuration.
     backend = PyreClient.LLM.Config.default_backend()
     model = PyreClient.LLM.Config.resolve_model(model_tier, backend)
 
-    Logger.info("[PyreClient.Executor] #{execution_id}: executing prompt via #{inspect(backend)} (tier: #{model_tier})")
-
-    # Convert message maps to the format PyreClient.LLM expects
     messages = Enum.map(messages, fn msg ->
       %{role: String.to_existing_atom(msg["role"]), content: msg["content"]}
     end)
 
-    # Build tools locally from role info (tool callbacks can't be serialized)
     tools = build_tools(role, working_dir, allowed_paths, allowed_commands)
 
-    # Build opts keyword list
     opts =
       opts_map
       |> Enum.map(fn {k, v} -> {String.to_existing_atom(k), v} end)
       |> Keyword.new()
+      |> Keyword.put(:messages, messages)
 
     output_fn = fn token -> send_output(execution_id, token) end
 
-    # Route based on backend capability — mirrors Helpers.call_llm/4 logic
-    result =
-      cond do
-        tools != [] and manages_tool_loop?(backend) ->
-          # CLI backend with tools — direct chat/4 (CLI manages its own tool loop)
-          backend.chat(model, messages, tools, Keyword.put(opts, :output_fn, output_fn))
-
-        tools != [] ->
-          # ReqLLM with tools — AgenticLoop (multi-turn tool-use conversation)
-          log_fn = fn msg -> send_output(execution_id, msg <> "\n") end
-          PyreClient.Tools.AgenticLoop.run(backend, model, messages, tools,
-            streaming: Keyword.get(opts, :streaming, false),
-            output_fn: output_fn,
-            log_fn: log_fn,
-            verbose: Keyword.get(opts, :verbose, false)
-          )
-
-        Keyword.get(opts, :streaming, true) ->
-          # Streaming without tools
-          backend.stream(model, messages, Keyword.put(opts, :output_fn, output_fn))
-
-        true ->
-          # Simple generation
-          backend.generate(model, messages, opts)
-      end
-
-    interactive? = get_in(payload, ["payload", "interactive"]) == true
-
-    case {result, interactive?} do
-      # Interactive execution: send result, block for continuation
-      {{:ok, text}, true} when is_binary(text) ->
-        send_to_server("action_result", %{
-          "execution_id" => execution_id,
-          "result_text" => text
-        })
-
-        interactive_loop(execution_id, backend, model, tools, opts, output_fn, text)
-
-      {{:ok, response}, true} ->
-        text = extract_text(response)
-        send_to_server("action_result", %{
-          "execution_id" => execution_id,
-          "result_text" => text
-        })
-
-        interactive_loop(execution_id, backend, model, tools, opts, output_fn, text)
-
-      # Non-interactive execution: send complete immediately
-      {{:ok, text}, false} when is_binary(text) ->
-        send_to_server("action_complete", %{
-          "execution_id" => execution_id,
-          "status" => "ok",
-          "result_text" => text
-        })
-
-      {{:ok, response}, false} ->
-        text = extract_text(response)
-        send_to_server("action_complete", %{
-          "execution_id" => execution_id,
-          "status" => "ok",
-          "result_text" => text
-        })
-
-      # Error: always complete immediately
-      {{:error, reason}, _} ->
-        Logger.error("[PyreClient.Executor] #{execution_id}: LLM error: #{inspect(reason)}")
-        send_to_server("action_complete", %{
-          "execution_id" => execution_id,
-          "status" => "error",
-          "result_text" => "Error: #{inspect(reason)}"
-        })
-    end
-  end
-
-  # --- Interactive Loop ---
-  # The execution process blocks here waiting for messages from the
-  # Executor GenServer (which receives them from the Channel).
-  # This keeps the capacity slot occupied and the working directory
-  # consistent between interactive turns.
-
-  defp interactive_loop(execution_id, backend, model, tools, opts, output_fn, _last_result) do
-    receive do
-      {:continue, payload} ->
-        # User replied — resume the CLI session
-        user_message = payload["message"] || ""
-        session_id = Keyword.get(opts, :session_id)
-
-        Logger.info("[PyreClient.Executor] #{execution_id}: interactive continue (session: #{session_id})")
-
-        messages = [%{role: :user, content: user_message}]
-        resume_opts = Keyword.put(opts, :resume, session_id)
-        resume_opts = Keyword.put(resume_opts, :output_fn, output_fn)
-
-        result =
-          if manages_tool_loop?(backend) do
-            backend.chat(model, messages, tools, resume_opts)
-          else
-            backend.generate(model, messages, resume_opts)
-          end
-
-        case result do
-          {:ok, text} when is_binary(text) ->
-            send_to_server("action_result", %{
-              "execution_id" => execution_id,
-              "result_text" => text
-            })
-
-            interactive_loop(execution_id, backend, model, tools, opts, output_fn, text)
-
-          {:ok, response} ->
-            text = extract_text(response)
-            send_to_server("action_result", %{
-              "execution_id" => execution_id,
-              "result_text" => text
-            })
-
-            interactive_loop(execution_id, backend, model, tools, opts, output_fn, text)
-
-          {:error, reason} ->
-            Logger.error("[PyreClient.Executor] #{execution_id}: interactive LLM error: #{inspect(reason)}")
-            send_to_server("action_complete", %{
-              "execution_id" => execution_id,
-              "status" => "error",
-              "result_text" => "Error: #{inspect(reason)}"
-            })
-        end
-
-      :finish ->
-        # Server says interactive loop is done — release the worker
-        Logger.info("[PyreClient.Executor] #{execution_id}: interactive finished")
-        send_to_server("action_complete", %{
-          "execution_id" => execution_id,
-          "status" => "ok"
-        })
-    after
-      @execution_timeout ->
-        Logger.error("[PyreClient.Executor] #{execution_id}: interactive loop timed out")
-        send_to_server("action_complete", %{
-          "execution_id" => execution_id,
-          "status" => "error",
-          "result_text" => "Error: interactive loop timed out"
-        })
-    end
-  end
-
-  # --- Action: unknown ---
-
-  defp execute(execution_id, unknown_type, _payload) do
-    Logger.warning("[PyreClient.Executor] #{execution_id}: unknown action type: #{unknown_type}")
-
-    send_to_server("action_complete", %{
-      "execution_id" => execution_id,
-      "status" => "error",
-      "result_text" => "Unknown action type: #{unknown_type}"
-    })
+    %{
+      execution_id: execution_id,
+      backend: backend,
+      model: model,
+      tools: tools,
+      opts: opts,
+      output_fn: output_fn,
+      send_to_server: &send_to_server/2,
+      interactive?: interactive?
+    }
   end
 
   # --- Tool Building ---
@@ -478,14 +987,6 @@ defmodule PyreClient.Executor do
   rescue
     ArgumentError -> []
   end
-
-  defp manages_tool_loop?(backend) do
-    function_exported?(backend, :manages_tool_loop?, 0) and backend.manages_tool_loop?()
-  end
-
-  defp extract_text(text) when is_binary(text), do: text
-  defp extract_text(response) when is_map(response), do: inspect(response)
-  defp extract_text(other), do: to_string(other)
 
   # --- Output Streaming ---
 
@@ -518,49 +1019,68 @@ defmodule PyreClient.Executor do
 end
 ```
 
+---
+
 ## Key Design Decisions
 
-### 1. `manages_tool_loop?` routing
+### 1. Client owns action lifecycle (security)
 
-The Executor mirrors the routing logic from pyre_lib's `Helpers.call_llm/4`:
-- **CLI backends** (`manages_tool_loop? = true`): ClaudeCLI, CursorCLI, CodexCLI — these manage their own tool loop internally. The `tools` parameter in `chat/4` is ignored; the CLI uses its own built-in tools (Bash, Read, Edit, Write, Glob, Grep for Claude).
-- **ReqLLM** (`manages_tool_loop? = false`): Routes through `PyreClient.Tools.AgenticLoop` for multi-turn tool-use conversations.
+The server sends action names and data parameters, never shell commands or arbitrary code. Each action type has a hardcoded client module that decides what to execute. This prevents WebSocket access from being exploited to compromise the client machine. The client is rich in capability (LLM backends, git, GitHub) but has no concept of workflows.
 
-### 2. Tools built locally from role info
+### 2. 4 action types cover all current needs
 
-Tool definitions include callback functions (for `read_file`, `write_file`, `run_command`, etc.) that can't be serialized over WebSocket. Instead:
-- The server sends **role info** in the `execute_prompt` payload: `role`, `working_dir`, `allowed_paths`, `allowed_commands`
-- The Executor builds `ReqLLM.Tool` structs locally via `PyreClient.Tools.for_role/3`
-- This keeps the tool sandbox (path validation, command allowlist) on the worker where the filesystem is accessible
+- `prompt` — 9 of 11 server actions (the 8 templates + QAReviewer)
+- `git_pr_setup` — PRSetup action (Feature flow, mid-pipeline)
+- `git_ship` — Shipper action (OvernightFeature flow, final stage)
+- `git_review` — PRReviewer action (CodeReview flow, sole stage)
 
-### 3. Streaming via output_fn
+New action types are rare (3 in the entire current codebase) and require lockstep updates to both pyre_lib and pyre_client. The `prompt` type covers the common case without client changes.
 
-For LLM calls, we pass an `output_fn` callback that sends each token/line back to the server as an `action_output` event. Both `stream/3`, `chat/4`, and `AgenticLoop.run/5` support this pattern.
+### 3. `manages_tool_loop?` routing
 
-### 4. Capacity tracking
+The shared `Actions.LLM` module mirrors the routing logic from pyre_lib's `Helpers.call_llm/4`:
+- **CLI backends** (`manages_tool_loop? = true`): direct chat/4 (CLI manages its own tool loop)
+- **ReqLLM** (`manages_tool_loop? = false`): routes through `AgenticLoop` for multi-turn tool use
 
-The Executor hardcodes `max_capacity: 1` and processes one action at a time. Dynamic capacity negotiation (notifying the server when capacity changes, rejecting over-capacity dispatches) is deferred. The `spawn_monitor` pattern and `active_executions` tracking stay in place for when concurrency is needed later.
+### 4. Tools built locally from role info
 
-### 5. Interactive blocking execution
+Tool definitions include callback functions that can't be serialized over WebSocket. The Executor builds `ReqLLM.Tool` structs locally via `PyreClient.Tools.for_role/3` from the `role`, `working_dir`, `allowed_paths`, and `allowed_commands` in the payload.
 
-For interactive stages, the execution process stays alive after the initial LLM call, blocking in `interactive_loop/7` via a `receive` block. The Executor GenServer forwards `action_continue`/`action_finish` messages from the Channel to the blocked process via `send(pid, ...)`. This keeps the capacity slot occupied and the working directory + file state consistent between turns.
+### 5. Interactive loop is shared infrastructure
 
-The spawned process is the natural home for this blocking — it keeps the Executor GenServer responsive (it can still handle `on_disconnected`, `handle_continue`, `handle_finish` casts) while the execution process blocks independently.
+The interactive loop (action_result → action_continue → action_result → action_finish) lives in the Executor, not in individual action modules. It always operates on the LLM portion. Post-LLM processing (git, GitHub, parsing) runs after the interactive loop completes. From the client's perspective, `action_continue` is always "resume the LLM session" — whether the message is a user reply or a finalize prompt.
 
-The `@execution_timeout` (24 hours) matches the workflow-level timeout. If the interactive loop times out, the execution sends `action_complete` with an error and exits.
+### 6. GitHub credentials via short-lived tokens
 
-## execute_prompt Payload Format
+The server sends a short-lived GitHub installation token in the `github` field of git action payloads. These are scoped to the specific repo, expire after ~1 hour, and are generated fresh per-request. The client uses `req` for 3 HTTP endpoints: create PR, create comment, mark ready for review. No credential storage on the client.
 
-The server sends:
+### 7. Action-specific error policies
 
-### Non-interactive prompt
+Each action module owns its error policy:
+- `Prompt`: fail on LLM error
+- `GitPRSetup`, `GitShip`: fail on any git or GitHub error (with chain)
+- `GitReview`: fire-and-forget for git/GitHub (action succeeds if LLM succeeds)
 
-**Note:** The payload does NOT include a `backend` field. The client determines which LLM backend to use from its own configuration (`config :pyre_client, llm_backend: :claude_cli`). The server only sends the `model_tier` — the client resolves both the backend and the concrete model string locally. This keeps backend management entirely within pyre_client.
+### 8. Streaming via output_fn
+
+All LLM calls pass an `output_fn` callback that sends each token/line back to the server as an `action_output` event. Both `stream/3`, `chat/4`, and `AgenticLoop.run/5` support this pattern.
+
+### 9. Capacity tracking
+
+`max_capacity: 1` for now. Interactive executions hold the capacity slot for the full duration (potentially hours/days). The `spawn_monitor` pattern and `active_executions` tracking stay in place for future concurrency.
+
+---
+
+## Payload Schemas
+
+**Note:** The payload does NOT include a `backend` field. The client determines which LLM backend to use from its own configuration. The server only sends the `model_tier`.
+
+### `prompt` payload (covers 9 of 11 server actions)
 
 ```json
 {
   "execution_id": "abc123",
-  "type": "execute_prompt",
+  "action": "prompt",
   "payload": {
     "model_tier": "standard",
     "interactive": false,
@@ -582,29 +1102,85 @@ The server sends:
 }
 ```
 
-### Interactive prompt
+Result: `{"text": "The architecture should..."}`
 
-Same as above but with `"interactive": true`. The execution process stays alive after the initial LLM call, blocking until it receives `action_continue` or `action_finish`.
+### `git_pr_setup` payload
 
 ```json
 {
-  "execution_id": "def456",
-  "type": "execute_prompt",
+  "execution_id": "abc456",
+  "action": "git_pr_setup",
   "payload": {
-    "model_tier": "advanced",
-    "interactive": true,
     "messages": [...],
-    "role": "programmer",
+    "model_tier": "advanced",
+    "role": "shipper",
     "working_dir": "/path/to/project",
-    "allowed_paths": ["/path/to/project"],
-    "opts": {
-      "streaming": true,
-      "session_id": "uuid-for-this-stage",
-      "max_turns": 500
-    }
+    "feature_description": "Build a products listing page",
+    "run_dir": "/path/to/run/dir",
+    "dry_run": false,
+    "github": {
+      "owner": "chrislaskey",
+      "repo": "myapp",
+      "token": "ghs_xxxx"
+    },
+    "opts": { "streaming": true, "session_id": "uuid" }
   }
 }
 ```
+
+Result: `{"text": "...", "branch_name": "feature/products-listing", "pr_url": "https://...", "pr_number": 42}`
+
+### `git_ship` payload
+
+Same shape as `git_pr_setup` but adds `allowed_paths`, `allowed_commands` (Shipper conditionally uses tools). No `dry_run` field.
+
+```json
+{
+  "execution_id": "abc789",
+  "action": "git_ship",
+  "payload": {
+    "messages": [...],
+    "model_tier": "advanced",
+    "role": "shipper",
+    "working_dir": "/path/to/project",
+    "allowed_paths": ["/path/to/project"],
+    "allowed_commands": ["mix", "elixir", "git"],
+    "github": {
+      "owner": "chrislaskey",
+      "repo": "myapp",
+      "token": "ghs_xxxx"
+    },
+    "opts": { "streaming": true, "session_id": "uuid" }
+  }
+}
+```
+
+Result: `{"text": "...", "shipping_summary": "Branch: feature/x, PR: Add feature X"}`
+
+### `git_review` payload
+
+```json
+{
+  "execution_id": "abc012",
+  "action": "git_review",
+  "payload": {
+    "messages": [...],
+    "model_tier": "advanced",
+    "role": "qa_reviewer",
+    "working_dir": "/path/to/project",
+    "run_dir": "/path/to/run/dir",
+    "pr_number": 42,
+    "github": {
+      "owner": "chrislaskey",
+      "repo": "myapp",
+      "token": "ghs_xxxx"
+    },
+    "opts": { "streaming": true, "session_id": "uuid" }
+  }
+}
+```
+
+Result: `{"text": "...", "verdict": "approve"}`
 
 ### action_continue (server → client)
 
@@ -623,32 +1199,29 @@ Same as above but with `"interactive": true`. The execution process stays alive 
 }
 ```
 
-### Client execution steps
-
-Non-interactive:
-1. Resolves backend from client config (`config :pyre_client, llm_backend: :claude_cli` → `PyreClient.LLM.ClaudeCLI`)
-2. Resolves `"standard"` tier → backend-specific model string (e.g., `"sonnet"` for ClaudeCLI, `"gpt-4o"` for CodexCLI)
-3. Converts message maps to `%{role: :system, content: "..."}`
-4. Builds tools from role info → `PyreClient.Tools.for_role(:software_architect, working_dir, opts)`
-5. Routes: ClaudeCLI `manages_tool_loop? = true` → `backend.chat/4` directly
-6. Streams tokens back as `action_output`
-7. Sends `action_complete` with the final text
-
-Interactive (same steps 1-6, then):
-7. Sends `action_result` with the initial text (NOT `action_complete`)
-8. Blocks waiting for `action_continue` or `action_finish`
-9. On `action_continue`: resumes CLI session with `resume: session_id`, loops back to step 6
-10. On `action_finish`: sends `action_complete`, execution process exits
-
-For ReqLLM with tools, step 5 routes through `PyreClient.Tools.AgenticLoop.run/5`, which calls `backend.chat/4` in a loop, executing tool calls and feeding results back until the LLM produces a final answer.
+---
 
 ## Adding New Action Types
 
-Adding a new action type is a single function clause:
+Adding a new action type requires:
 
-```elixir
-defp execute(execution_id, "execute_tool", payload) do
-  # New action type — handle tool execution
-  # ...
-end
-```
+1. **Create the action module** in `lib/pyre_client/actions/`:
+   ```elixir
+   defmodule PyreClient.Actions.NewType do
+     @behaviour PyreClient.Actions
+
+     @impl true
+     def execute(payload, context) do
+       # ...
+     end
+   end
+   ```
+
+2. **Register it** in `PyreClient.Actions.resolve/1`:
+   ```elixir
+   def resolve("new_type"), do: {:ok, PyreClient.Actions.NewType}
+   ```
+
+3. **Add the server-side dispatch** in pyre_lib (the action module that builds the payload and interprets the result).
+
+Both libraries must be updated in lockstep. This is acceptable: there are no independent users, both are co-developed, and new action types are rare.
