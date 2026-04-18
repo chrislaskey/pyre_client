@@ -79,8 +79,8 @@ pyre_lib retains no LLM backends, tools, or session management. Its actions will
 ```
 ┌──────────────────────────────────────────────────────┐
 │                 Pyre Web Server                       │
-│  Oban → QueueManager → Presence → WorkflowJob        │
-│  (pyre_app uses pyre_lib + pyre_client)              │
+│  pyre_lib (orchestration) + PyreWeb (channels)        │
+│  Host app provides: queue, worker selection, DB       │
 └────────┬───────────────┬───────────────┬─────────────┘
          │ WS             │ WS             │ WS
     ┌────┴─────┐    ┌────┴─────┐    ┌────┴──────────┐
@@ -91,29 +91,55 @@ pyre_lib retains no LLM backends, tools, or session management. Its actions will
 
 All worker types are identical from the server's perspective. The "local" client is just pyre_client running in the same BEAM VM, connecting via localhost WebSocket.
 
+**Note on worker selection and queuing:** Queue management (e.g., Oban) and worker selection (e.g., picking a worker from Presence by capacity/backend) are **host-app responsibilities**, not pyre_lib concerns. pyre_lib provides the hooks (`Pyre.Config` callbacks, `PyreWeb.Presence` tracking) that host apps build on. For example, `pyre_app` implements `App.Pyre.Workers.QueueManager` (watches Presence, scales Oban queues) and `App.Workers.WorkflowJob` (selects workers, dispatches actions). pyre_client doesn't need to know about these — it just advertises its capabilities (backends, capacity, workflows) in the channel join payload.
+
 ### Execution Flow
 
 When pyre_lib dispatches an action to a worker:
+
+**Non-interactive** (e.g., code review, task):
 
 ```
 pyre_lib (server)                    pyre_client (worker)
 ─────────────────                    ────────────────────
 Flow.run_action()
   → dispatch execute_prompt          → Executor receives payload
-    {model, messages,                   → resolve backend
+    {model_tier, messages,              → resolve backend + model
      role, working_dir,                 → build tools for role
-     session_id, ...}                   → route:
-                                          CLI + tools → backend.chat/4
-                                          ReqLLM + tools → AgenticLoop
-                                          streaming → backend.stream/3
-                                          else → backend.generate/3
+     interactive: false, ...}           → route to LLM call
   ← streams action_output             ← streams tokens/lines
-  ← receives action_complete          ← sends final result text
-  → processes result
+  ← receives action_complete         ← sends final result text
+  → processes result                    → execution done, slot freed
     (parse verdict, git ops, etc.)
 ```
 
-The worker handles the full LLM interaction including tool execution. The orchestration layer processes the text result (parsing, git operations, artifact writing, GitHub API calls).
+**Interactive** (e.g., feature engineering with user feedback):
+
+```
+pyre_lib (server)                    pyre_client (worker)
+─────────────────                    ────────────────────
+Flow.run_action()
+  → dispatch execute_prompt          → Executor receives payload
+    {interactive: true, ...}            → run initial LLM call
+  ← streams action_output             ← streams tokens/lines
+  ← receives action_result            ← sends result (NOT complete)
+                                        → blocks waiting...
+  → enters interactive wait              (capacity slot stays occupied)
+    (RunServer holds from ref)
+                                     ...time passes...
+  user replies →
+  → sends action_continue             → resumes CLI session
+    {message: "add tests..."}           (resume: session_id)
+  ← streams action_output             ← streams tokens
+  ← receives action_result            ← sends new result, blocks again
+
+  user says continue (no replies) →
+  → sends action_finish                → sends action_complete
+                                        → execution exits, slot freed
+  → processes final result
+```
+
+The worker handles the full LLM interaction including tool execution. The orchestration layer processes the text result (parsing, git operations, artifact writing, GitHub API calls). During interactive stages, both server and client block — the server's flow Task blocks on `await_user_action_fn`, and the client's execution process blocks in `interactive_loop`, maintaining working directory and file state consistency.
 
 ## Key Design Decisions
 
@@ -162,9 +188,12 @@ When pyre_client is built, pyre_lib will need these changes (done separately):
 
 1. **Add `pyre_client` as optional dev dependency** — only for tests that need the mock backend
 2. **Remove execution modules** — `Pyre.LLM`, `Pyre.LLM.*`, `Pyre.Tools`, `Pyre.Tools.AgenticLoop`, `Pyre.Session`, `Pyre.Session.Registry`
-3. **Refactor actions** — Replace `Helpers.call_llm/4` with remote dispatch to workers via WebSocket
-4. **Refactor interactive loops** — Flow `interactive_loop` and `finalize_artifact` dispatch continuations via WebSocket instead of calling `context.llm.chat` directly
-5. **Update `Pyre.Config`** — Remove `list_llm_backends/0`, `get_llm_backend/1` (backend selection moves to client config)
-6. **Potential orchestration-level LLM** — If pyre_lib needs lightweight LLM calls for orchestration (summarizing, parsing for tool orchestration), it would have its own simple, independent implementation — not shared with pyre_client
+3. **Refactor actions** — Replace `Helpers.call_llm/4` with remote dispatch to workers via WebSocket (synchronous dispatch-and-wait: PubSub subscribe → broadcast to worker → block until `action_result` or `action_complete`)
+4. **Refactor interactive loops** — Server sends `action_continue` with user's reply message to the blocked worker; sends `action_finish` when the interactive loop ends. The flow Task blocks on `await_user_action_fn` as it does today — the only change is that the LLM call happens remotely instead of locally
+5. **Add new channel events** — `PyreWeb.Channel` needs:
+   - `handle_in("action_result", ...)` — intermediate result from interactive execution (broadcasts to PubSub like `action_output`)
+   - Server-side code to `push(socket, "action_continue", ...)` and `push(socket, "action_finish", ...)` to the client
+6. **Update `Pyre.Config`** — Remove `list_llm_backends/0`, `get_llm_backend/1` (backend selection moves to client config)
+7. **Potential orchestration-level LLM** — If pyre_lib needs lightweight LLM calls for orchestration (summarizing, parsing for tool orchestration), it would have its own simple, independent implementation — not shared with pyre_client
 
 These changes are **not part of the pyre_client build**.

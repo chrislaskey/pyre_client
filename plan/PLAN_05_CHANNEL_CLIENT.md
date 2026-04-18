@@ -10,8 +10,10 @@
 2. Track channel join state (joining → joined → left)
 3. Handle `phx_reply` to join requests
 4. Handle `action` pushes from the server (dispatch to Executor)
-5. Handle `presence_diff` events
-6. Send `action_output`, `action_complete`, `update_metadata` messages
+5. Handle `action_continue` pushes (forward to blocked execution process via Executor)
+6. Handle `action_finish` pushes (signal execution to release via Executor)
+7. Handle `presence_diff` events
+8. Send `action_output`, `action_result`, `action_complete`, `update_metadata` messages
 
 ## Channel State
 
@@ -137,6 +139,26 @@ defmodule PyreClient.Channel do
     # Delegate to executor — it will send frames back via Connection casts
     Executor.handle_action(payload)
 
+    {[], ch}
+  end
+
+  # Interactive continuation — user replied, forward to blocked execution process
+  def handle_message(
+    %Message{topic: @topic, event: "action_continue", payload: payload},
+    %{status: :joined} = ch
+  ) do
+    Logger.info("[PyreClient.Channel] Received action_continue: #{payload["execution_id"]}")
+    Executor.handle_continue(payload)
+    {[], ch}
+  end
+
+  # Interactive finish — release the blocked execution process
+  def handle_message(
+    %Message{topic: @topic, event: "action_finish", payload: payload},
+    %{status: :joined} = ch
+  ) do
+    Logger.info("[PyreClient.Channel] Received action_finish: #{payload["execution_id"]}")
+    Executor.handle_finish(payload)
     {[], ch}
   end
 
@@ -266,14 +288,14 @@ When joining `pyre:connections`, the client sends its full worker metadata:
 {
   "connection_id": "linux-worker-1",
   "status": "active",
-  "available_capacity": 2,
+  "available_capacity": 1,
   "backends": ["claude_cli"],
   "enabled_workflows": [],
   "name": "build-server-east"
 }
 ```
 
-This metadata is tracked by `PyreWeb.Presence` and read by the `QueueManager` and `WorkflowJob` on the server for worker selection.
+This metadata is tracked by `PyreWeb.Presence` and read by host-app worker selectors (e.g., pyre_app's `QueueManager` and `WorkflowJob`) for dispatch routing.
 
 ## How the Executor Sends Messages
 

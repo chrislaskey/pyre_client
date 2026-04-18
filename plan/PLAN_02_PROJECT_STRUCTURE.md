@@ -152,7 +152,7 @@ end
 
 ### Backend Advertisement
 
-The client advertises its available LLM backends in Presence metadata. The server's `WorkflowJob.select_worker/1` filters workers by backend compatibility.
+The client advertises its available LLM backends in Presence metadata. Host app worker selectors (e.g., pyre_app's `WorkflowJob.select_worker/1`) filter workers by backend compatibility.
 
 ```elixir
 backends = PyreClient.LLM.Config.list_backends() |> Enum.map(& &1.name)
@@ -171,7 +171,7 @@ config :pyre_client,
   server_url: System.get_env("PYRE_SERVER_URL", "ws://localhost:4000/pyre/websocket"),
   connection_id: System.get_env("PYRE_CONNECTION_ID", "worker-1"),
   connection_name: System.get_env("PYRE_CONNECTION_NAME", "my-build-server"),
-  available_capacity: 2,
+  available_capacity: 1,
   enabled_workflows: []
 ```
 
@@ -369,6 +369,33 @@ defmodule PyreClient.LLM.Config do
     ]
   end
 
+  # --- Model tier resolution ---
+  # The server sends a tier atom ("fast", "standard", "advanced").
+  # The client resolves it to a backend-specific model string.
+
+  @default_model_aliases %{
+    "fast" => "anthropic:claude-haiku-4-5",
+    "standard" => "anthropic:claude-sonnet-4-20250514",
+    "advanced" => "anthropic:claude-opus-4-20250514"
+  }
+
+  @doc """
+  Resolves a model tier string to a concrete model identifier.
+
+  The server sends tier names ("fast", "standard", "advanced") in
+  execute_prompt payloads. Each client resolves them to backend-appropriate
+  model strings. CLI backends further map these internally (e.g.,
+  ClaudeCLI maps "anthropic:claude-haiku-4-5" → "haiku").
+
+  Override via `config :pyre_client, :model_aliases, %{...}`.
+  """
+  def resolve_model(tier, _backend) when is_binary(tier) do
+    aliases = Application.get_env(:pyre_client, :model_aliases, @default_model_aliases)
+    Map.get(aliases, tier, tier)
+  end
+
+  def resolve_model(nil, _backend), do: resolve_model("standard", nil)
+
   # Default implementations
 
   def list_backends(_), do: included_backends()
@@ -419,7 +446,7 @@ defmodule PyreClient do
       config :pyre_client,
         server_url: "ws://localhost:4000/pyre/websocket",
         connection_id: "my-worker",
-        available_capacity: 2,
+        available_capacity: 1,
         llm_backend: :claude_cli
 
   Start in your supervision tree:
@@ -490,7 +517,7 @@ config :pyre_client,
   server_url: "ws://localhost:#{System.get_env("PORT", "4000")}/pyre/websocket",
   connection_id: "local-worker",
   connection_name: "local",
-  available_capacity: 2,
+  available_capacity: 1,
   llm_backend: :claude_cli
 ```
 

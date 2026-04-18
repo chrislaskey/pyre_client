@@ -20,7 +20,7 @@ For context, here's what the Swift `RemoteCommandService` does:
 // 3. Streams output line-by-line: channel.pushAsync("action_output", ...)
 // 4. Tracks exit codes per command
 // 5. Stops on first failure
-// 6. Sends completion: channel.pushAsync("action_complete", ...)
+// 6. Sends completion: channel.pushAsync("action_finish", ...)
 ```
 
 Our Executor mirrors this for shell commands, and adds LLM prompt execution using the full `PyreClient.LLM` backend system with tool support.
@@ -30,9 +30,35 @@ Our Executor mirrors this for shell commands, and adds LLM prompt execution usin
 | Type | Payload | What it does |
 |------|---------|-------------|
 | `execute_commands` | `%{"commands" => ["cmd1", ...]}` | Run shell commands sequentially via Port |
-| `execute_prompt` | `%{"messages" => [...], "model" => "...", ...}` | Call an LLM backend with optional tool execution |
+| `execute_prompt` | `%{"messages" => [...], "model_tier" => "standard", ...}` | Call an LLM backend with optional tool execution |
+
+## Channel Events
+
+### Client → Server
+
+| Event | When | Payload |
+|-------|------|---------|
+| `action_output` | Streaming token/line during execution | `%{"execution_id" => id, "line" => text}` |
+| `action_result` | LLM call finished, interactive stage awaiting continuation | `%{"execution_id" => id, "result_text" => text}` |
+| `action_complete` | Execution fully done, capacity slot freed | `%{"execution_id" => id, "exit_codes" => [...], "result_text" => text}` |
+
+### Server → Client
+
+| Event | When | Payload |
+|-------|------|---------|
+| `action` | Dispatch new action to worker | `%{"execution_id" => id, "type" => "execute_prompt", "payload" => {...}}` |
+| `action_continue` | User replied during interactive stage | `%{"execution_id" => id, "message" => text}` |
+| `action_finish` | Interactive loop done, release the worker | `%{"execution_id" => id}` |
+
+The distinction between `action_result` and `action_complete` is key:
+- **`action_result`**: The LLM call is done but the execution stays alive. The capacity slot remains occupied. The spawned process blocks waiting for `action_continue` or `action_finish`.
+- **`action_complete`**: The execution is fully done. The capacity slot is freed.
+
+Non-interactive executions skip `action_result` entirely and go straight to `action_complete`.
 
 ## Execution Flow
+
+### Non-interactive (standard)
 
 ```
 Server pushes "action" event
@@ -66,6 +92,39 @@ Channel.handle_message → Executor.handle_action/1
        └─ result_text (prompt output)
 ```
 
+### Interactive (blocking wait for user input)
+
+```
+Server pushes "action" event (interactive: true)
+  │
+  ▼
+Executor.handle_action/1 → spawns execution process
+  │
+  ├─ 1. Run initial LLM call (same routing as non-interactive)
+  │    ├─ Stream tokens → "action_output"
+  │    └─ Collect result text
+  │
+  ├─ 2. Send "action_result" (NOT "action_complete")
+  │    └─ Execution process stays alive, capacity slot occupied
+  │
+  ├─ 3. Block waiting for continuation message from Executor GenServer
+  │    │
+  │    ├─ Server receives user reply → pushes "action_continue"
+  │    │    ├─ Channel routes to Executor.handle_continue/1
+  │    │    ├─ Executor forwards message to blocked execution process
+  │    │    └─ Execution process resumes CLI session (resume: session_id)
+  │    │         ├─ Stream tokens → "action_output"
+  │    │         ├─ Send "action_result" with new result
+  │    │         └─ Block again...
+  │    │
+  │    └─ Server sends "action_finish"
+  │         ├─ Channel routes to Executor.handle_finish/1
+  │         ├─ Executor signals execution process to exit
+  │         └─ Execution process sends "action_complete" and exits
+  │
+  └─ 4. Capacity slot freed on "action_complete"
+```
+
 ## Module: `PyreClient.Executor`
 
 ```elixir
@@ -92,8 +151,10 @@ defmodule PyreClient.Executor do
 
   defstruct [
     :max_capacity,
-    :active_executions  # %{execution_id => pid}
+    :active_executions  # %{execution_id => pid}  (pid of the spawned execution process)
   ]
+
+  @execution_timeout 86_400_000  # 24 hours — matches workflow-level timeout
 
   # --- Start ---
 
@@ -132,6 +193,16 @@ defmodule PyreClient.Executor do
     GenServer.cast(@name, :on_disconnected)
   end
 
+  @doc "Forward an action_continue from the server to a blocked execution process."
+  def handle_continue(payload) do
+    GenServer.cast(@name, {:handle_continue, payload})
+  end
+
+  @doc "Forward an action_finish from the server to release an execution."
+  def handle_finish(payload) do
+    GenServer.cast(@name, {:handle_finish, payload})
+  end
+
   # --- Callbacks ---
 
   @impl true
@@ -152,12 +223,41 @@ defmodule PyreClient.Executor do
   end
 
   def handle_cast(:on_disconnected, state) do
-    for {_id, pid} <- state.active_executions, Process.alive?(pid) do
-      Process.exit(pid, :shutdown)
-    end
+    # Channel drops are expected — don't kill in-flight work.
+    # The Connection will reconnect and rejoin automatically.
+    # In-flight executions continue; output sent during disconnection
+    # may be lost, but the final action_complete will be sent after
+    # reconnection if the execution finishes while disconnected.
+    Logger.warning("[PyreClient.Executor] Disconnected, #{map_size(state.active_executions)} executions still running")
+    {:noreply, state}
+  end
 
-    Logger.warning("[PyreClient.Executor] Disconnected, killed #{map_size(state.active_executions)} active executions")
-    {:noreply, %{state | active_executions: %{}}}
+  def handle_cast({:handle_continue, payload}, state) do
+    execution_id = payload["execution_id"]
+
+    case Map.get(state.active_executions, execution_id) do
+      nil ->
+        Logger.warning("[PyreClient.Executor] action_continue for unknown execution #{execution_id}")
+        {:noreply, state}
+
+      pid ->
+        send(pid, {:continue, payload})
+        {:noreply, state}
+    end
+  end
+
+  def handle_cast({:handle_finish, payload}, state) do
+    execution_id = payload["execution_id"]
+
+    case Map.get(state.active_executions, execution_id) do
+      nil ->
+        Logger.warning("[PyreClient.Executor] action_finish for unknown execution #{execution_id}")
+        {:noreply, state}
+
+      pid ->
+        send(pid, :finish)
+        {:noreply, state}
+    end
   end
 
   @impl true
@@ -218,7 +318,7 @@ defmodule PyreClient.Executor do
   defp execute(execution_id, "execute_prompt", payload) do
     inner = payload["payload"] || %{}
     backend_name = inner["backend"]
-    model = inner["model"] || "standard"
+    model_tier = inner["model_tier"] || "standard"
     messages = inner["messages"] || []
     role = inner["role"]
     working_dir = inner["working_dir"]
@@ -228,8 +328,9 @@ defmodule PyreClient.Executor do
 
     Logger.info("[PyreClient.Executor] #{execution_id}: executing prompt via #{backend_name || "default"}")
 
-    # Resolve the backend module
+    # Resolve the backend module and model
     backend = PyreClient.LLM.Config.get_backend(backend_name)
+    model = PyreClient.LLM.Config.resolve_model(model_tier, backend)
 
     # Convert message maps to the format PyreClient.LLM expects
     messages = Enum.map(messages, fn msg ->
@@ -273,29 +374,121 @@ defmodule PyreClient.Executor do
           backend.generate(model, messages, opts)
       end
 
-    case result do
-      {:ok, text} when is_binary(text) ->
+    interactive? = get_in(payload, ["payload", "interactive"]) == true
+
+    case {result, interactive?} do
+      # Interactive execution: send result, block for continuation
+      {{:ok, text}, true} when is_binary(text) ->
+        send_to_server("action_result", %{
+          "execution_id" => execution_id,
+          "result_text" => text
+        })
+
+        interactive_loop(execution_id, backend, model, tools, opts, output_fn, text)
+
+      {{:ok, response}, true} ->
+        text = extract_text(response)
+        send_to_server("action_result", %{
+          "execution_id" => execution_id,
+          "result_text" => text
+        })
+
+        interactive_loop(execution_id, backend, model, tools, opts, output_fn, text)
+
+      # Non-interactive execution: send complete immediately
+      {{:ok, text}, false} when is_binary(text) ->
         send_to_server("action_complete", %{
           "execution_id" => execution_id,
           "exit_codes" => [0],
           "result_text" => text
         })
 
-      {:ok, response} ->
-        # ReqLLM.Response struct or similar
-        text = if is_map(response), do: inspect(response), else: to_string(response)
+      {{:ok, response}, false} ->
+        text = extract_text(response)
         send_to_server("action_complete", %{
           "execution_id" => execution_id,
           "exit_codes" => [0],
           "result_text" => text
         })
 
-      {:error, reason} ->
+      # Error: always complete immediately
+      {{:error, reason}, _} ->
         Logger.error("[PyreClient.Executor] #{execution_id}: LLM error: #{inspect(reason)}")
         send_to_server("action_complete", %{
           "execution_id" => execution_id,
           "exit_codes" => [1],
           "result_text" => "Error: #{inspect(reason)}"
+        })
+    end
+  end
+
+  # --- Interactive Loop ---
+  # The execution process blocks here waiting for messages from the
+  # Executor GenServer (which receives them from the Channel).
+  # This keeps the capacity slot occupied and the working directory
+  # consistent between interactive turns.
+
+  defp interactive_loop(execution_id, backend, model, tools, opts, output_fn, _last_result) do
+    receive do
+      {:continue, payload} ->
+        # User replied — resume the CLI session
+        user_message = payload["message"] || ""
+        session_id = Keyword.get(opts, :session_id)
+
+        Logger.info("[PyreClient.Executor] #{execution_id}: interactive continue (session: #{session_id})")
+
+        messages = [%{role: :user, content: user_message}]
+        resume_opts = Keyword.put(opts, :resume, session_id)
+        resume_opts = Keyword.put(resume_opts, :output_fn, output_fn)
+
+        result =
+          if manages_tool_loop?(backend) do
+            backend.chat(model, messages, tools, resume_opts)
+          else
+            backend.generate(model, messages, resume_opts)
+          end
+
+        case result do
+          {:ok, text} when is_binary(text) ->
+            send_to_server("action_result", %{
+              "execution_id" => execution_id,
+              "result_text" => text
+            })
+
+            interactive_loop(execution_id, backend, model, tools, opts, output_fn, text)
+
+          {:ok, response} ->
+            text = extract_text(response)
+            send_to_server("action_result", %{
+              "execution_id" => execution_id,
+              "result_text" => text
+            })
+
+            interactive_loop(execution_id, backend, model, tools, opts, output_fn, text)
+
+          {:error, reason} ->
+            Logger.error("[PyreClient.Executor] #{execution_id}: interactive LLM error: #{inspect(reason)}")
+            send_to_server("action_complete", %{
+              "execution_id" => execution_id,
+              "exit_codes" => [1],
+              "result_text" => "Error: #{inspect(reason)}"
+            })
+        end
+
+      :finish ->
+        # Server says interactive loop is done — release the worker
+        Logger.info("[PyreClient.Executor] #{execution_id}: interactive finished")
+        send_to_server("action_complete", %{
+          "execution_id" => execution_id,
+          "exit_codes" => [0]
+        })
+    after
+      @execution_timeout ->
+        Logger.error("[PyreClient.Executor] #{execution_id}: interactive loop timed out")
+        send_to_server("action_complete", %{
+          "execution_id" => execution_id,
+          "exit_codes" => [1],
+          "result_text" => "Error: interactive loop timed out"
         })
     end
   end
@@ -329,6 +522,10 @@ defmodule PyreClient.Executor do
   defp manages_tool_loop?(backend) do
     function_exported?(backend, :manages_tool_loop?, 0) and backend.manages_tool_loop?()
   end
+
+  defp extract_text(text) when is_binary(text), do: text
+  defp extract_text(response) when is_map(response), do: inspect(response)
+  defp extract_text(other), do: to_string(other)
 
   # --- Shell Command Execution ---
 
@@ -434,7 +631,7 @@ end
 | Output streaming | `channel.pushAsync("action_output", ...)` | `WebSockex.cast(Connection, {:send_event, ...})` |
 | Sequential execution | For loop, break on failure | Recursive function, stop on non-zero |
 | Exit code tracking | Array of exit codes per command | Same — array of exit codes |
-| Completion | `channel.pushAsync("action_complete", ...)` | Same via `send_to_server` |
+| Completion | `channel.pushAsync("action_finish", ...)` | `send_to_server("action_complete", ...)` |
 | Unknown types | `DebugLogger.warning(...)` | `Logger.warning(...)`, send failure completion |
 | Backend selection | N/A | `PyreClient.LLM.Config.get_backend/1` |
 
@@ -471,11 +668,21 @@ For LLM calls, we pass an `output_fn` callback that sends each token/line back t
 
 ### 6. Capacity tracking
 
-The Executor tracks concurrent executions and updates server Presence metadata in real-time.
+The Executor always reports `available_capacity: 1` and processes one action at a time. The `spawn_monitor` pattern supports future concurrency, but multi-action execution is deferred. Capacity tracking and Presence metadata infrastructure stays in place for when it's needed.
+
+### 7. Interactive blocking execution
+
+For interactive stages, the execution process stays alive after the initial LLM call, blocking in `interactive_loop/7` via a `receive` block. The Executor GenServer forwards `action_continue`/`action_finish` messages from the Channel to the blocked process via `send(pid, ...)`. This keeps the capacity slot occupied and the working directory + file state consistent between turns.
+
+The spawned process is the natural home for this blocking — it keeps the Executor GenServer responsive (it can still handle `on_disconnected`, `handle_continue`, `handle_finish` casts) while the execution process blocks independently.
+
+The `@execution_timeout` (24 hours) matches the workflow-level timeout. If the interactive loop times out, the execution sends `action_complete` with an error and exits.
 
 ## execute_prompt Payload Format
 
 The server sends:
+
+### Non-interactive prompt
 
 ```json
 {
@@ -483,7 +690,8 @@ The server sends:
   "type": "execute_prompt",
   "payload": {
     "backend": "claude_cli",
-    "model": "sonnet",
+    "model_tier": "standard",
+    "interactive": false,
     "messages": [
       {"role": "system", "content": "You are a software architect..."},
       {"role": "user", "content": "Design a REST API for..."}
@@ -502,15 +710,66 @@ The server sends:
 }
 ```
 
-The client:
-1. Resolves `"claude_cli"` → `PyreClient.LLM.ClaudeCLI`
-2. Converts message maps to `%{role: :system, content: "..."}`
-3. Builds tools from role info → `PyreClient.Tools.for_role(:software_architect, working_dir, opts)`
-4. Routes: ClaudeCLI `manages_tool_loop? = true` → `backend.chat/4` directly (tools ignored by CLI)
-5. Streams tokens back as `action_output`
-6. Sends `action_complete` with the final text
+### Interactive prompt
 
-For ReqLLM with tools, step 4 would instead route through `PyreClient.Tools.AgenticLoop.run/5`, which calls `backend.chat/4` in a loop, executing tool calls and feeding results back until the LLM produces a final answer.
+Same as above but with `"interactive": true`. The execution process stays alive after the initial LLM call, blocking until it receives `action_continue` or `action_finish`.
+
+```json
+{
+  "execution_id": "def456",
+  "type": "execute_prompt",
+  "payload": {
+    "backend": "claude_cli",
+    "model_tier": "advanced",
+    "interactive": true,
+    "messages": [...],
+    "role": "programmer",
+    "working_dir": "/path/to/project",
+    "allowed_paths": ["/path/to/project"],
+    "opts": {
+      "streaming": true,
+      "session_id": "uuid-for-this-stage",
+      "max_turns": 500
+    }
+  }
+}
+```
+
+### action_continue (server → client)
+
+```json
+{
+  "execution_id": "def456",
+  "message": "Looks good, but can you add error handling to the API endpoints?"
+}
+```
+
+### action_finish (server → client)
+
+```json
+{
+  "execution_id": "def456"
+}
+```
+
+### Client execution steps
+
+Non-interactive:
+1. Resolves `"claude_cli"` → `PyreClient.LLM.ClaudeCLI`
+2. Resolves `"standard"` tier → backend-specific model string (e.g., `"sonnet"` for ClaudeCLI, `"gpt-4o"` for CodexCLI)
+3. Converts message maps to `%{role: :system, content: "..."}`
+4. Builds tools from role info → `PyreClient.Tools.for_role(:software_architect, working_dir, opts)`
+5. Routes: ClaudeCLI `manages_tool_loop? = true` → `backend.chat/4` directly
+6. Streams tokens back as `action_output`
+7. Sends `action_complete` with the final text
+
+Interactive (same steps 1-6, then):
+7. Sends `action_result` with the initial text (NOT `action_complete`)
+8. Blocks waiting for `action_continue` or `action_finish`
+9. On `action_continue`: resumes CLI session with `resume: session_id`, loops back to step 6
+10. On `action_finish`: sends `action_complete`, execution process exits
+
+For ReqLLM with tools, step 5 routes through `PyreClient.Tools.AgenticLoop.run/5`, which calls `backend.chat/4` in a loop, executing tool calls and feeding results back until the LLM produces a final answer.
 
 ## Adding New Action Types
 
