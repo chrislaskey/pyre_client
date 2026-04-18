@@ -2,35 +2,19 @@
 
 ## Overview
 
-`PyreClient.Executor` is the Elixir equivalent of pyre_native's `RemoteCommandService`, extended with full LLM backend support including tool execution. It receives action dispatches from the Channel, routes by action type, executes locally, streams output back, and reports completion.
+`PyreClient.Executor` receives action dispatches from the Channel, executes LLM prompts locally via the `PyreClient.LLM` backend system, streams output back, and reports completion.
 
-The Executor handles two categories of work:
-1. **Shell commands** — same as pyre_native: run commands via `Port`, stream output
-2. **LLM prompts** — resolve a backend via `PyreClient.LLM.Config`, route through the appropriate execution path (direct chat, AgenticLoop, stream, or generate), stream results back
+The Executor resolves the backend from the client's own config (`PyreClient.LLM.Config.default_backend/0`), resolves the model tier to a concrete model string, routes through the appropriate execution path (direct chat, AgenticLoop, stream, or generate), and streams results back to the server. The server does NOT specify which backend to use — it only sends the `model_tier`.
 
 The Executor has **no knowledge of workflows, stages, or orchestration**. It executes individual actions the server tells it to.
 
-## pyre_native Reference
-
-For context, here's what the Swift `RemoteCommandService` does:
-
-```swift
-// 1. Receives commands array
-// 2. Executes each sequentially via ShellExecutor.stream()
-// 3. Streams output line-by-line: channel.pushAsync("action_output", ...)
-// 4. Tracks exit codes per command
-// 5. Stops on first failure
-// 6. Sends completion: channel.pushAsync("action_finish", ...)
-```
-
-Our Executor mirrors this for shell commands, and adds LLM prompt execution using the full `PyreClient.LLM` backend system with tool support.
+**Note:** pyre_native (Swift) currently has a proof-of-concept for arbitrary shell command execution (`RemoteCommandService`). pyre_client does NOT implement that — it focuses exclusively on LLM prompt execution. Shell commands that LLM agents need are handled by the LLM backends themselves (e.g., Claude CLI's built-in Bash tool, or Pyre's `run_command` tool via the AgenticLoop).
 
 ## Action Types
 
 | Type | Payload | What it does |
 |------|---------|-------------|
-| `execute_commands` | `%{"commands" => ["cmd1", ...]}` | Run shell commands sequentially via Port |
-| `execute_prompt` | `%{"messages" => [...], "model_tier" => "standard", ...}` | Call an LLM backend with optional tool execution |
+| `execute_prompt` | `%{"messages" => [...], "model_tier" => "standard", ...}` | Call an LLM backend with optional tool execution. The client resolves the backend locally from its own config — the server does NOT specify which backend to use. |
 
 ## Channel Events
 
@@ -40,7 +24,7 @@ Our Executor mirrors this for shell commands, and adds LLM prompt execution usin
 |-------|------|---------|
 | `action_output` | Streaming token/line during execution | `%{"execution_id" => id, "line" => text}` |
 | `action_result` | LLM call finished, interactive stage awaiting continuation | `%{"execution_id" => id, "result_text" => text}` |
-| `action_complete` | Execution fully done, capacity slot freed | `%{"execution_id" => id, "exit_codes" => [...], "result_text" => text}` |
+| `action_complete` | Execution fully done, capacity slot freed | `%{"execution_id" => id, "status" => "ok" | "error", "result_text" => text}` |
 
 ### Server → Client
 
@@ -66,30 +50,22 @@ Server pushes "action" event
   ▼
 Channel.handle_message → Executor.handle_action/1
   │
-  ├─ 1. Route by action type
-  │    ├─ "execute_commands" → run shell commands
-  │    ├─ "execute_prompt"   → call LLM backend
-  │    └─ unknown → log warning, send failure
-  │
-  ├─ 2a. Shell commands: execute sequentially via Port
-  │    ├─ Stream stdout/stderr line-by-line → send "action_output"
-  │    ├─ Collect exit code per command
-  │    └─ Stop on first non-zero exit code
-  │
-  ├─ 2b. LLM prompt: resolve backend, route by capability
-  │    ├─ Resolve backend module via PyreClient.LLM.Config.get_backend/1
+  ├─ 1. Resolve backend, model, and tools
+  │    ├─ Resolve backend from client's own config (PyreClient.LLM.Config.default_backend/0)
+  │    ├─ Resolve model tier → model string (PyreClient.LLM.Config.resolve_model/2)
   │    ├─ Build tools locally if role provided (PyreClient.Tools.for_role/3)
-  │    ├─ Route:
-  │    │    ├─ tools + manages_tool_loop? → backend.chat/4 (CLI handles tools)
-  │    │    ├─ tools + !manages_tool_loop? → AgenticLoop (ReqLLM multi-turn)
-  │    │    ├─ streaming → backend.stream/3
-  │    │    └─ else → backend.generate/3
-  │    ├─ Stream tokens/lines → send "action_output"
-  │    └─ Collect final result
+  │
+  ├─ 2. Route by backend capability
+  │    ├─ tools + manages_tool_loop? → backend.chat/4 (CLI handles tools)
+  │    ├─ tools + !manages_tool_loop? → AgenticLoop (ReqLLM multi-turn)
+  │    ├─ streaming → backend.stream/3
+  │    └─ else → backend.generate/3
+  │    Stream tokens → send "action_output"
+  │    Collect final result
   │
   └─ 3. Send "action_complete"
-       ├─ exit_codes (commands) or status (prompt)
-       └─ result_text (prompt output)
+       ├─ status ("ok" or "error")
+       └─ result_text
 ```
 
 ### Interactive (blocking wait for user input)
@@ -130,11 +106,7 @@ Executor.handle_action/1 → spawns execution process
 ```elixir
 defmodule PyreClient.Executor do
   @moduledoc """
-  Executes actions dispatched by the Pyre Web server.
-
-  Handles two action types:
-  - `execute_commands`: Shell commands via Port (mirrors pyre_native)
-  - `execute_prompt`: LLM calls via PyreClient.LLM backends with tool support
+  Executes LLM prompt actions dispatched by the Pyre Web server.
 
   Routes LLM calls based on backend capability:
   - CLI backends (manages_tool_loop? = true): direct chat/4
@@ -299,25 +271,10 @@ defmodule PyreClient.Executor do
     pid
   end
 
-  # --- Action: execute_commands ---
-
-  defp execute(execution_id, "execute_commands", payload) do
-    commands = get_in(payload, ["payload", "commands"]) || []
-    Logger.info("[PyreClient.Executor] #{execution_id}: executing #{length(commands)} commands")
-
-    exit_codes = run_commands_sequentially(execution_id, commands)
-
-    send_to_server("action_complete", %{
-      "execution_id" => execution_id,
-      "exit_codes" => exit_codes
-    })
-  end
-
   # --- Action: execute_prompt ---
 
   defp execute(execution_id, "execute_prompt", payload) do
     inner = payload["payload"] || %{}
-    backend_name = inner["backend"]
     model_tier = inner["model_tier"] || "standard"
     messages = inner["messages"] || []
     role = inner["role"]
@@ -326,11 +283,13 @@ defmodule PyreClient.Executor do
     allowed_commands = inner["allowed_commands"]
     opts_map = inner["opts"] || %{}
 
-    Logger.info("[PyreClient.Executor] #{execution_id}: executing prompt via #{backend_name || "default"}")
-
-    # Resolve the backend module and model
-    backend = PyreClient.LLM.Config.get_backend(backend_name)
+    # Backend is determined entirely by the client's own config — the server
+    # sends only the model_tier. The client resolves both the backend and
+    # the concrete model string from its local configuration.
+    backend = PyreClient.LLM.Config.default_backend()
     model = PyreClient.LLM.Config.resolve_model(model_tier, backend)
+
+    Logger.info("[PyreClient.Executor] #{execution_id}: executing prompt via #{inspect(backend)} (tier: #{model_tier})")
 
     # Convert message maps to the format PyreClient.LLM expects
     messages = Enum.map(messages, fn msg ->
@@ -399,7 +358,7 @@ defmodule PyreClient.Executor do
       {{:ok, text}, false} when is_binary(text) ->
         send_to_server("action_complete", %{
           "execution_id" => execution_id,
-          "exit_codes" => [0],
+          "status" => "ok",
           "result_text" => text
         })
 
@@ -407,7 +366,7 @@ defmodule PyreClient.Executor do
         text = extract_text(response)
         send_to_server("action_complete", %{
           "execution_id" => execution_id,
-          "exit_codes" => [0],
+          "status" => "ok",
           "result_text" => text
         })
 
@@ -416,7 +375,7 @@ defmodule PyreClient.Executor do
         Logger.error("[PyreClient.Executor] #{execution_id}: LLM error: #{inspect(reason)}")
         send_to_server("action_complete", %{
           "execution_id" => execution_id,
-          "exit_codes" => [1],
+          "status" => "error",
           "result_text" => "Error: #{inspect(reason)}"
         })
     end
@@ -470,7 +429,7 @@ defmodule PyreClient.Executor do
             Logger.error("[PyreClient.Executor] #{execution_id}: interactive LLM error: #{inspect(reason)}")
             send_to_server("action_complete", %{
               "execution_id" => execution_id,
-              "exit_codes" => [1],
+              "status" => "error",
               "result_text" => "Error: #{inspect(reason)}"
             })
         end
@@ -480,14 +439,14 @@ defmodule PyreClient.Executor do
         Logger.info("[PyreClient.Executor] #{execution_id}: interactive finished")
         send_to_server("action_complete", %{
           "execution_id" => execution_id,
-          "exit_codes" => [0]
+          "status" => "ok"
         })
     after
       @execution_timeout ->
         Logger.error("[PyreClient.Executor] #{execution_id}: interactive loop timed out")
         send_to_server("action_complete", %{
           "execution_id" => execution_id,
-          "exit_codes" => [1],
+          "status" => "error",
           "result_text" => "Error: interactive loop timed out"
         })
     end
@@ -500,7 +459,8 @@ defmodule PyreClient.Executor do
 
     send_to_server("action_complete", %{
       "execution_id" => execution_id,
-      "exit_codes" => [1]
+      "status" => "error",
+      "result_text" => "Unknown action type: #{unknown_type}"
     })
   end
 
@@ -527,75 +487,13 @@ defmodule PyreClient.Executor do
   defp extract_text(response) when is_map(response), do: inspect(response)
   defp extract_text(other), do: to_string(other)
 
-  # --- Shell Command Execution ---
-
-  defp run_commands_sequentially(execution_id, commands) do
-    run_commands_sequentially(execution_id, commands, 0, [])
-  end
-
-  defp run_commands_sequentially(_execution_id, [], _index, exit_codes) do
-    Enum.reverse(exit_codes)
-  end
-
-  defp run_commands_sequentially(execution_id, [cmd | rest], index, exit_codes) do
-    send_output(execution_id, "[cmd #{index}] #{cmd}")
-
-    exit_code = stream_command(execution_id, cmd, index)
-    new_exit_codes = [exit_code | exit_codes]
-
-    if exit_code == 0 do
-      run_commands_sequentially(execution_id, rest, index + 1, new_exit_codes)
-    else
-      remaining = List.duplicate(-1, length(rest))
-      Enum.reverse(new_exit_codes) ++ remaining
-    end
-  end
-
-  @doc false
-  def stream_command(execution_id, command, command_index) do
-    port =
-      Port.open({:spawn, command}, [
-        :binary,
-        :exit_status,
-        :stderr_to_stdout,
-        {:line, 4096}
-      ])
-
-    collect_port_output(port, execution_id, command_index)
-  end
-
-  defp collect_port_output(port, execution_id, command_index) do
-    receive do
-      {^port, {:data, {:eol, line}}} ->
-        send_output(execution_id, line, command_index)
-        collect_port_output(port, execution_id, command_index)
-
-      {^port, {:data, {:noeol, line}}} ->
-        send_output(execution_id, line, command_index)
-        collect_port_output(port, execution_id, command_index)
-
-      {^port, {:exit_status, status}} ->
-        status
-    after
-      3_600_000 ->
-        Port.close(port)
-        send_output(execution_id, "[timeout] Command timed out after 1 hour")
-        1
-    end
-  end
-
   # --- Output Streaming ---
 
-  defp send_output(execution_id, line, command_index \\ nil) do
-    payload = %{
+  defp send_output(execution_id, content) do
+    send_to_server("action_output", %{
       "execution_id" => execution_id,
-      "line" => line
-    }
-
-    payload =
-      if command_index, do: Map.put(payload, "command_index", command_index), else: payload
-
-    send_to_server("action_output", payload)
+      "content" => content
+    })
   end
 
   # --- Helpers ---
@@ -620,57 +518,30 @@ defmodule PyreClient.Executor do
 end
 ```
 
-## Comparison with pyre_native
-
-| Aspect | pyre_native (Swift) | pyre_client (Elixir) |
-|--------|---------------------|----------------------|
-| Process model | `RemoteCommandService.shared` singleton | `GenServer` with name registration |
-| Shell execution | `Subprocess` API with `AsyncBytes` | `Port.open/2` with `:line` mode |
-| LLM execution | Not supported | Full backend system with tool support |
-| Tool execution | Not supported | CLI backends: internal tools; ReqLLM: AgenticLoop |
-| Output streaming | `channel.pushAsync("action_output", ...)` | `WebSockex.cast(Connection, {:send_event, ...})` |
-| Sequential execution | For loop, break on failure | Recursive function, stop on non-zero |
-| Exit code tracking | Array of exit codes per command | Same — array of exit codes |
-| Completion | `channel.pushAsync("action_finish", ...)` | `send_to_server("action_complete", ...)` |
-| Unknown types | `DebugLogger.warning(...)` | `Logger.warning(...)`, send failure completion |
-| Backend selection | N/A | `PyreClient.LLM.Config.get_backend/1` |
-
 ## Key Design Decisions
 
-### 1. Port-based command execution
-
-Using `Port.open/2` with `{:spawn, command}` gives us:
-- Line-by-line streaming via `{:line, 4096}` option
-- Exit code via `:exit_status`
-- Combined stdout+stderr via `:stderr_to_stdout`
-- Non-blocking — runs in a separate OS process
-
-### 2. Sequential execution, stop on failure
-
-Matches pyre_native behavior exactly. Commands run one at a time; first failure stops the sequence. Remaining commands get exit code `-1` (not executed).
-
-### 3. `manages_tool_loop?` routing
+### 1. `manages_tool_loop?` routing
 
 The Executor mirrors the routing logic from pyre_lib's `Helpers.call_llm/4`:
 - **CLI backends** (`manages_tool_loop? = true`): ClaudeCLI, CursorCLI, CodexCLI — these manage their own tool loop internally. The `tools` parameter in `chat/4` is ignored; the CLI uses its own built-in tools (Bash, Read, Edit, Write, Glob, Grep for Claude).
 - **ReqLLM** (`manages_tool_loop? = false`): Routes through `PyreClient.Tools.AgenticLoop` for multi-turn tool-use conversations.
 
-### 4. Tools built locally from role info
+### 2. Tools built locally from role info
 
 Tool definitions include callback functions (for `read_file`, `write_file`, `run_command`, etc.) that can't be serialized over WebSocket. Instead:
 - The server sends **role info** in the `execute_prompt` payload: `role`, `working_dir`, `allowed_paths`, `allowed_commands`
 - The Executor builds `ReqLLM.Tool` structs locally via `PyreClient.Tools.for_role/3`
 - This keeps the tool sandbox (path validation, command allowlist) on the worker where the filesystem is accessible
 
-### 5. Streaming via output_fn
+### 3. Streaming via output_fn
 
 For LLM calls, we pass an `output_fn` callback that sends each token/line back to the server as an `action_output` event. Both `stream/3`, `chat/4`, and `AgenticLoop.run/5` support this pattern.
 
-### 6. Capacity tracking
+### 4. Capacity tracking
 
-The Executor always reports `available_capacity: 1` and processes one action at a time. The `spawn_monitor` pattern supports future concurrency, but multi-action execution is deferred. Capacity tracking and Presence metadata infrastructure stays in place for when it's needed.
+The Executor hardcodes `max_capacity: 1` and processes one action at a time. Dynamic capacity negotiation (notifying the server when capacity changes, rejecting over-capacity dispatches) is deferred. The `spawn_monitor` pattern and `active_executions` tracking stay in place for when concurrency is needed later.
 
-### 7. Interactive blocking execution
+### 5. Interactive blocking execution
 
 For interactive stages, the execution process stays alive after the initial LLM call, blocking in `interactive_loop/7` via a `receive` block. The Executor GenServer forwards `action_continue`/`action_finish` messages from the Channel to the blocked process via `send(pid, ...)`. This keeps the capacity slot occupied and the working directory + file state consistent between turns.
 
@@ -684,12 +555,13 @@ The server sends:
 
 ### Non-interactive prompt
 
+**Note:** The payload does NOT include a `backend` field. The client determines which LLM backend to use from its own configuration (`config :pyre_client, llm_backend: :claude_cli`). The server only sends the `model_tier` — the client resolves both the backend and the concrete model string locally. This keeps backend management entirely within pyre_client.
+
 ```json
 {
   "execution_id": "abc123",
   "type": "execute_prompt",
   "payload": {
-    "backend": "claude_cli",
     "model_tier": "standard",
     "interactive": false,
     "messages": [
@@ -719,7 +591,6 @@ Same as above but with `"interactive": true`. The execution process stays alive 
   "execution_id": "def456",
   "type": "execute_prompt",
   "payload": {
-    "backend": "claude_cli",
     "model_tier": "advanced",
     "interactive": true,
     "messages": [...],
@@ -755,7 +626,7 @@ Same as above but with `"interactive": true`. The execution process stays alive 
 ### Client execution steps
 
 Non-interactive:
-1. Resolves `"claude_cli"` → `PyreClient.LLM.ClaudeCLI`
+1. Resolves backend from client config (`config :pyre_client, llm_backend: :claude_cli` → `PyreClient.LLM.ClaudeCLI`)
 2. Resolves `"standard"` tier → backend-specific model string (e.g., `"sonnet"` for ClaudeCLI, `"gpt-4o"` for CodexCLI)
 3. Converts message maps to `%{role: :system, content: "..."}`
 4. Builds tools from role info → `PyreClient.Tools.for_role(:software_architect, working_dir, opts)`

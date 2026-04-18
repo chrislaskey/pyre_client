@@ -34,7 +34,7 @@ defmodule PyreClient.ProtocolTest do
   end
 
   test "decode V2 array format" do
-    raw = ~s(["1","2","pyre:connections","action",{"type":"execute_commands"}])
+    raw = ~s(["1","2","pyre:connections","action",{"type":"execute_prompt"}])
     assert {:ok, msg} = Protocol.decode(raw)
     assert msg.join_ref == "1"
     assert msg.ref == "2"
@@ -279,28 +279,7 @@ end
 
 ## Layer 3: Executor Tests
 
-Test command execution directly — no WebSocket needed.
-
-```elixir
-# test/pyre_client/executor_test.exs
-defmodule PyreClient.ExecutorTest do
-  use ExUnit.Case, async: false
-
-  test "stream_command returns exit code 0 for successful command" do
-    assert PyreClient.Executor.stream_command("test-1", "echo hello", 0) == 0
-  end
-
-  test "stream_command returns non-zero for failing command" do
-    assert PyreClient.Executor.stream_command("test-2", "false", 0) != 0
-  end
-
-  test "stream_command returns non-zero for missing command" do
-    assert PyreClient.Executor.stream_command("test-3", "nonexistent_command_xyz", 0) != 0
-  end
-end
-```
-
-Note: `stream_command/3` is marked `@doc false` but made public for testing. The output streaming calls `send_to_server` which casts to Connection — in tests without a Connection process, those casts are silently dropped.
+The Executor is a GenServer that spawns execution processes. Testing the full dispatch flow requires the Connection process (for `send_to_server`), so executor tests are deferred to the integration layer. The LLM routing logic is exercised indirectly through the LLM backend tests and AgenticLoop tests.
 
 ## Layer 4: LLM Backend Tests
 
@@ -419,21 +398,15 @@ defmodule PyreClient.LLM.ConfigTest do
     assert "codex_cli" in names
   end
 
-  test "get_backend resolves by name" do
-    assert Config.get_backend("claude_cli") == PyreClient.LLM.ClaudeCLI
-    assert Config.get_backend("req_llm") == PyreClient.LLM.ReqLLM
-  end
-
-  test "get_backend falls back to default when name not found" do
+  test "default_backend returns configured backend" do
     Application.put_env(:pyre_client, :llm_backend, :claude_cli)
-    assert Config.get_backend("nonexistent") == PyreClient.LLM.ClaudeCLI
+    assert Config.default_backend() == PyreClient.LLM.ClaudeCLI
     Application.delete_env(:pyre_client, :llm_backend)
   end
 
-  test "get_backend with nil returns default" do
-    Application.put_env(:pyre_client, :llm_backend, :req_llm)
-    assert Config.get_backend(nil) == PyreClient.LLM.ReqLLM
+  test "default_backend falls back to ReqLLM when not configured" do
     Application.delete_env(:pyre_client, :llm_backend)
+    assert Config.default_backend() == PyreClient.LLM.ReqLLM
   end
 end
 ```
@@ -563,7 +536,7 @@ end
 | `Session` | Unit | Yes | None (`:crypto`) |
 | `Session.Registry` | Unit | No | Agent process |
 | `Tools` | Unit | Yes | `req_llm` (for `ReqLLM.Tool`) |
-| `Executor` | Unit | No | Shell commands only |
+| `Executor` | Integration | No | MockServer (via Connection) |
 | `PyreClient.LLM.Mock` | Unit | No | Process dictionary |
 | `PyreClient.LLM.ClaudeCLI` | Unit | No | Application env |
 | `PyreClient.LLM.Config` | Unit | No | Application env |

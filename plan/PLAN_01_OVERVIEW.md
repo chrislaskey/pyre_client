@@ -4,13 +4,15 @@
 
 An Elixir library (`pyre_client`) that is the **execution layer** for the Pyre platform. It owns all LLM backends, the tool system, the agentic loop, session management, and the WebSocket client that connects to a Pyre Web server.
 
-pyre_client connects as a worker, receives dispatched actions (shell commands, LLM prompts), executes them locally, and streams results back. Mirrors the `pyre_native` (Swift) client model — no knowledge of workflows, stages, or orchestration.
+pyre_client connects as a worker, receives dispatched actions (LLM prompts), executes them locally, and streams results back. It is a thin client with no knowledge of workflows, stages, or orchestration.
 
 pyre_lib is the **orchestration layer** — it runs workflows, dispatches actions to workers, and serves the web UI. It does not execute actions locally or call LLM backends directly.
 
+**CRITICAL — This is a MOVE, not a copy.** The execution modules listed below currently live in pyre_lib. They are being **relocated** to pyre_client as their permanent, sole home. After pyre_client is built, these modules will be **deleted** from pyre_lib entirely. There must be exactly ONE implementation of each module — in pyre_client. Do NOT duplicate code across both libraries. Do NOT leave stubs, re-exports, or compatibility shims in pyre_lib. The source of truth for all LLM backends, tools, the agentic loop, and session management is pyre_client. pyre_lib will be refactored later (see "Future pyre_lib Changes") to dispatch to workers instead of calling these modules directly.
+
 ## Why
 
-pyre_lib handles orchestration: workflows, flows, actions, the run lifecycle, and the web UI. But it should not be responsible for the mechanics of executing an LLM prompt or running shell commands — that's the worker's job.
+pyre_lib handles orchestration: workflows, flows, actions, the run lifecycle, and the web UI. But it should not be responsible for the mechanics of executing an LLM prompt — that's the worker's job.
 
 By making pyre_client own the entire execution layer, we get:
 - **Clean separation**: orchestration (pyre_lib) vs execution (pyre_client)
@@ -40,10 +42,10 @@ pyre_lib and pyre_client have **no compile-time dependency** on each other. Host
 
 ### What Lives in pyre_client
 
-All backend execution modules move from pyre_lib to pyre_client:
+All backend execution modules **move** from pyre_lib to pyre_client. The "Source" column shows where the existing implementation lives today — use it as the reference implementation. Adapt the code for the `PyreClient` namespace, `req_llm` direct dependency, and `:pyre_client` config namespace. Do NOT create new modules from scratch when a working implementation already exists in pyre_lib.
 
-| Module (pyre_lib) | Becomes (pyre_client) | What it does |
-|-------------------|-----------------------|-------------|
+| Source (pyre_lib — reference impl) | Target (pyre_client — sole owner) | What it does |
+|-------------------------------------|-----------------------------------|-------------|
 | `Pyre.LLM` | `PyreClient.LLM` | Behaviour: `generate/3`, `stream/3`, `chat/4`, `manages_tool_loop?/0` |
 | `Pyre.LLM.ReqLLM` | `PyreClient.LLM.ReqLLM` | API-based LLM calls via req_llm |
 | `Pyre.LLM.ClaudeCLI` | `PyreClient.LLM.ClaudeCLI` | Claude Code CLI subprocess |
@@ -72,7 +74,7 @@ All backend execution modules move from pyre_lib to pyre_client:
 | `Pyre.Plugins.*` | Persona loading, artifact management |
 | `PyreWeb.*` | Web UI, LiveViews, channels, router |
 
-pyre_lib retains no LLM backends, tools, or session management. Its actions will dispatch `execute_prompt` to workers instead of calling `Helpers.call_llm/4` directly. This refactoring happens separately after pyre_client is built.
+After the migration is complete, pyre_lib retains **zero** LLM backends, tools, agentic loop code, or session management. All of `Pyre.LLM`, `Pyre.LLM.*`, `Pyre.Tools`, `Pyre.Tools.AgenticLoop`, `Pyre.Session`, and `Pyre.Session.Registry` will be deleted from pyre_lib. Its actions will dispatch `execute_prompt` to workers instead of calling `Helpers.call_llm/4` directly. This refactoring happens separately after pyre_client is built.
 
 ### Deployment Model
 
@@ -104,9 +106,10 @@ pyre_lib (server)                    pyre_client (worker)
 ─────────────────                    ────────────────────
 Flow.run_action()
   → dispatch execute_prompt          → Executor receives payload
-    {model_tier, messages,              → resolve backend + model
-     role, working_dir,                 → build tools for role
-     interactive: false, ...}           → route to LLM call
+    {model_tier, messages,              → resolve backend from config
+     role, working_dir,                 → resolve model from tier
+     interactive: false, ...}           → build tools for role
+                                        → route to LLM call
   ← streams action_output             ← streams tokens/lines
   ← receives action_complete         ← sends final result text
   → processes result                    → execution done, slot freed
@@ -147,17 +150,21 @@ The worker handles the full LLM interaction including tool execution. The orches
 
 2. **Independent peer libraries** — No compile-time dependency between pyre_lib and pyre_client. Host apps compose both.
 
-3. **Direct `req_llm` dependency** — Depends on `req_llm ~> 1.9` directly (zero jido dependency). Needed for ReqLLM backend, AgenticLoop tool types, and response classification.
+3. **Direct `req_llm` dependency** — `req_llm` is a **standalone hex package** (confirmed — it is NOT bundled inside jido_ai). pyre_client depends on `req_llm ~> 1.9` directly, giving it access to `ReqLLM.Tool`, `ReqLLM.Response`, `ReqLLM.Context`, `ReqLLM.ToolCall`, etc. with zero jido/jido_ai dependency. pyre_lib reaches these same types through its `jido_ai` dependency, but pyre_client does not need that transitive path.
 
-4. **Tools built locally** — Tool definitions include callbacks (functions) that can't be serialized over WebSocket. The Executor builds `ReqLLM.Tool` structs locally from role/working_dir info in the payload.
+4. **Client-owned backend selection** — The server does NOT tell the client which backend to use. The server sends `model_tier` ("fast", "standard", "advanced"); the client resolves the backend from its own config (`config :pyre_client, llm_backend: :claude_cli`) and the model string from tier aliases. Each client deployment manages its own list of enabled backends. The server only sees the backends the client advertises in its join payload — it uses this for worker selection, not for directing backend choice.
 
-5. **`manages_tool_loop?` routing** — The Executor mirrors `Helpers.call_llm/4`'s routing: CLI backends handle tools internally, ReqLLM uses AgenticLoop.
+5. **Tools built locally** — Tool definitions include callbacks (functions) that can't be serialized over WebSocket. The Executor builds `ReqLLM.Tool` structs locally from role/working_dir info in the payload.
 
-6. **Thin client, mirrors pyre_native** — No knowledge of workflows, stages, or orchestration. Receives individual actions, executes them, streams output back.
+6. **`manages_tool_loop?` routing** — The Executor mirrors `Helpers.call_llm/4`'s routing: CLI backends handle tools internally, ReqLLM uses AgenticLoop.
 
-7. **WebSockex + Phoenix V2 protocol** — OTP-compatible WebSocket client speaking the channel wire format directly.
+7. **Thin client** — No knowledge of workflows, stages, or orchestration. Receives individual actions, executes them, streams output back.
 
-8. **Library, not application** — No auto-start. Host app configures and starts processes.
+8. **WebSockex + Phoenix V2 protocol** — OTP-compatible WebSocket client speaking the channel wire format directly.
+
+9. **Library, not application** — No auto-start. Host app configures and starts processes.
+
+10. **Capacity hardcoded to 1** — `max_capacity` is 1 for now. Dynamic capacity negotiation (notifying the server when slots free up, rejecting over-capacity dispatches) is deferred. Infrastructure for future concurrency stays in place.
 
 ## Stages
 
@@ -168,7 +175,7 @@ The worker handles the full LLM interaction including tool execution. The orches
 | 3 | `PLAN_03_PHOENIX_PROTOCOL.md` | Phoenix Channel V2 wire protocol implementation |
 | 4 | `PLAN_04_WEBSOCKET_CONNECTION.md` | WebSockex client with ping/pong keepalive |
 | 5 | `PLAN_05_CHANNEL_CLIENT.md` | Channel join, presence, message handling |
-| 6 | `PLAN_06_EXECUTOR.md` | Action dispatch, command execution, LLM routing, output streaming |
+| 6 | `PLAN_06_EXECUTOR.md` | Action dispatch, LLM routing, output streaming |
 | 7 | `PLAN_07_TESTING.md` | Test strategy and mock patterns |
 
 ## Dependency Graph
@@ -193,7 +200,7 @@ When pyre_client is built, pyre_lib will need these changes (done separately):
 5. **Add new channel events** — `PyreWeb.Channel` needs:
    - `handle_in("action_result", ...)` — intermediate result from interactive execution (broadcasts to PubSub like `action_output`)
    - Server-side code to `push(socket, "action_continue", ...)` and `push(socket, "action_finish", ...)` to the client
-6. **Update `Pyre.Config`** — Remove `list_llm_backends/0`, `get_llm_backend/1` (backend selection moves to client config)
+6. **Update `Pyre.Config`** — Remove `list_llm_backends/0`, `get_llm_backend/1` (backend selection is entirely owned by pyre_client — each client deployment configures its own backends)
 7. **Potential orchestration-level LLM** — If pyre_lib needs lightweight LLM calls for orchestration (summarizing, parsing for tool orchestration), it would have its own simple, independent implementation — not shared with pyre_client
 
 These changes are **not part of the pyre_client build**.

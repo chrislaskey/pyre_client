@@ -124,7 +124,7 @@ end
 
 **Why `req_llm`?** Three reasons:
 1. `PyreClient.LLM.ReqLLM` backend wraps `ReqLLM.generate_text/3` and `ReqLLM.stream_text/3`
-2. `PyreClient.Tools` defines tools as `ReqLLM.Tool` structs (with callbacks for file I/O and shell commands)
+2. `PyreClient.Tools` defines tools as `ReqLLM.Tool` structs (with callbacks for file I/O and command execution)
 3. `PyreClient.Tools.AgenticLoop` uses `ReqLLM.Response.classify/1`, `ReqLLM.Context.append/2`, and `ReqLLM.Tool.execute/2`
 
 **Why not `jido_ai`?** `req_llm` has zero dependency on `jido`. The chain is `jido_ai → jido + req_llm`. By depending on `req_llm` directly, workers get full LLM capability without any workflow machinery.
@@ -238,8 +238,8 @@ defmodule PyreClient.Config do
     Application.get_env(:pyre_client, :heartbeat_interval_ms, 30_000)
   end
 
-  def resolve_backend(name) do
-    PyreClient.LLM.Config.get_backend(name)
+  def resolve_backend do
+    PyreClient.LLM.Config.default_backend()
   end
 
   defp generate_connection_id do
@@ -336,7 +336,7 @@ defmodule PyreClient.LLM.Config do
   """
 
   @callback list_backends() :: [map()]
-  @callback get_backend(String.t() | nil) :: module()
+  @callback default_backend() :: module()
 
   defmacro __using__(_opts) do
     quote do
@@ -352,8 +352,16 @@ defmodule PyreClient.LLM.Config do
     config_module().list_backends()
   end
 
-  def get_backend(name) do
-    config_module().get_backend(name)
+  @doc """
+  Returns the backend module configured for this client deployment.
+
+  The server does NOT specify which backend to use — each client
+  deployment is configured with its own backend via
+  `config :pyre_client, llm_backend: :claude_cli`. The server only
+  sends the model tier; the client resolves both backend and model.
+  """
+  def default_backend do
+    config_module().default_backend()
   end
 
   def included_backends do
@@ -370,8 +378,8 @@ defmodule PyreClient.LLM.Config do
   end
 
   # --- Model tier resolution ---
-  # The server sends a tier atom ("fast", "standard", "advanced").
-  # The client resolves it to a backend-specific model string.
+  # The server sends a tier string ("fast", "standard", "advanced").
+  # The client resolves it to a backend-specific model string locally.
 
   @default_model_aliases %{
     "fast" => "anthropic:claude-haiku-4-5",
@@ -396,20 +404,11 @@ defmodule PyreClient.LLM.Config do
 
   def resolve_model(nil, _backend), do: resolve_model("standard", nil)
 
-  # Default implementations
+  # Default callback implementations
 
   def list_backends(_), do: included_backends()
 
-  def get_backend(nil), do: default_backend()
-
-  def get_backend(name) when is_binary(name) do
-    case Enum.find(list_backends(), &(&1.name == name)) do
-      nil -> default_backend()
-      backend -> backend.module
-    end
-  end
-
-  defp default_backend do
+  def default_backend(_) do
     case Application.get_env(:pyre_client, :llm_backend) do
       :claude_cli -> PyreClient.LLM.ClaudeCLI
       :cursor_cli -> PyreClient.LLM.CursorCLI
@@ -430,9 +429,8 @@ defmodule PyreClient do
   Execution layer and thin WebSocket client for Pyre.
 
   Connects to a Pyre Web server over WebSocket, registers as a worker,
-  and executes dispatched actions (shell commands, LLM prompts). Mirrors
-  the pyre_native (Swift) client model — no knowledge of workflows or
-  orchestration.
+  and executes dispatched LLM prompt actions. A thin client with no
+  knowledge of workflows or orchestration.
 
   Owns all LLM backends, the tool system, the agentic loop, and session
   management. Independent of pyre_lib — no compile-time dependency.
