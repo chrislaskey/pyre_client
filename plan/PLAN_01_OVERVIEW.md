@@ -2,6 +2,8 @@
 
 ## What We're Building
 
+**CRITICAL — We are not referencing `pyre_web` or `pyre_core` - these apps are soft deprecated.** Only reference `pyre_lib`, `pyre_client`, and `pyre_native`. The `pyre_app` directory has an advanced reference implementation of how to build a more complex app on the `pyre_lib` library.
+
 An Elixir library (`pyre_client`) that is the **execution layer** for the Pyre platform. It owns all LLM backends, the tool system, the agentic loop, session management, and the WebSocket client that connects to a Pyre Web server.
 
 pyre_client connects as a worker, receives dispatched actions (LLM prompts), executes them locally, and streams results back. It is a thin client with no knowledge of workflows, stages, or orchestration.
