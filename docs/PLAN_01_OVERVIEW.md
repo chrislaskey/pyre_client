@@ -58,8 +58,7 @@ All backend execution modules **move** from pyre_lib to pyre_client. The "Source
 | `Pyre.Tools.AgenticLoop` | `PyreClient.Tools.AgenticLoop` | Multi-turn tool-use loop for ReqLLM backend |
 | `Pyre.Session` | `PyreClient.Session` | Connection ID generation only (LLM session IDs come from server payloads) |
 | `Pyre.Session.Registry` | `PyreClient.Session.Registry` | Maps execution_id → session_id from server payloads; also maps pyre session IDs to backend session IDs (CursorCLI) |
-| _(new)_ | `PyreClient.LLM.Config` | Backend listing and resolution |
-| _(new)_ | `PyreClient.Config` | Connection settings |
+| _(new)_ | `PyreClient.Config` | Unified config: connection settings, backend/action listing and resolution |
 | _(new)_ | `PyreClient.Connection` | WebSockex WebSocket client |
 | _(new)_ | `PyreClient.Channel` | Phoenix channel state machine |
 | _(new)_ | `PyreClient.Protocol` | Phoenix V2 wire protocol |
@@ -213,7 +212,7 @@ The worker handles the full action lifecycle: LLM calls, response parsing, git o
 | 3 | `PLAN_03_PHOENIX_PROTOCOL.md` | Phoenix Channel V2 wire protocol implementation |
 | 4 | `PLAN_04_WEBSOCKET_CONNECTION.md` | WebSockex client with ping/pong keepalive |
 | 5 | `PLAN_05_CHANNEL_CLIENT.md` | Channel join, presence, message handling |
-| 6 | `PLAN_06_EXECUTOR.md` | Action dispatch, LLM routing, output streaming |
+| 6 | `PLAN_06_RUNNER.md` | Action dispatch, LLM routing, output streaming |
 | 7 | `PLAN_07_TESTING.md` | Test strategy and mock patterns |
 | 8 | `PLAN_08_SERVER_CHANGES.md` | pyre_lib/pyre_web changes for remote dispatch |
 | 9 | `PLAN_09_NATIVE_ALIGNMENT.md` | pyre_native changes to align with the new protocol |

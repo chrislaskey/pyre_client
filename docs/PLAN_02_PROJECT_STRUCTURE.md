@@ -23,7 +23,6 @@ pyre_client/
 │   │   ├── config.ex                  # Client configuration
 │   │   ├── llm.ex                     # PyreClient.LLM behaviour
 │   │   ├── llm/
-│   │   │   ├── config.ex              # PyreClient.LLM.Config — backend listing/resolution
 │   │   │   ├── req_llm.ex             # PyreClient.LLM.ReqLLM
 │   │   │   ├── claude_cli.ex          # PyreClient.LLM.ClaudeCLI
 │   │   │   ├── cursor_cli.ex          # PyreClient.LLM.CursorCLI
@@ -59,7 +58,6 @@ pyre_client/
     │   │   ├── git_review_test.exs
     │   │   └── git_test.exs
     │   └── llm/
-    │       ├── config_test.exs
     │       ├── claude_cli_test.exs
     │       └── mock_test.exs
     └── support/
@@ -161,7 +159,7 @@ end
 | `ping_interval_ms` | `20_000` | WebSocket-level ping interval |
 | `heartbeat_interval_ms` | `30_000` | Phoenix heartbeat interval |
 | `llm_backend` | `:req_llm` | Default LLM backend atom |
-| `llm_config` | `PyreClient.LLM.Config` | Config module for backend listing |
+| `config` | `PyreClient.Config` | Config module for overriding backends, actions, and model resolution |
 | `claude_cli_executable` | `"claude"` | Path to Claude CLI binary |
 | `cursor_cli_executable` | `"cursor-agent"` | Path to Cursor CLI binary |
 | `codex_cli_executable` | `"codex"` | Path to Codex CLI binary |
@@ -171,7 +169,7 @@ end
 The client advertises its available LLM backends in Presence metadata. Host app worker selectors (e.g., pyre_app's `WorkflowJob.select_worker/1`) filter workers by backend compatibility.
 
 ```elixir
-backends = PyreClient.LLM.Config.list_backends() |> Enum.map(& &1.name)
+backends = PyreClient.Config.list_backends() |> Enum.map(& &1.name)
 # => ["req_llm", "claude_cli", "cursor_cli", "codex_cli"]
 ```
 
@@ -191,15 +189,18 @@ config :pyre_client,
   enabled_workflows: []
 ```
 
-### Custom Backend Registration
+### Custom Config Override
+
+Host apps can override any combination of callbacks by providing a custom config module:
 
 ```elixir
-defmodule MyApp.LLMConfig do
-  use PyreClient.LLM.Config
+defmodule MyApp.PyreClientConfig do
+  use PyreClient.Config
 
-  @impl PyreClient.LLM.Config
+  # Override backends to add a custom one
+  @impl PyreClient.Config
   def list_backends do
-    PyreClient.LLM.Config.included_backends() ++ [
+    PyreClient.Config.included_backends() ++ [
       %{
         module: MyApp.LLM.CustomBackend,
         name: "custom_backend",
@@ -208,19 +209,188 @@ defmodule MyApp.LLMConfig do
       }
     ]
   end
+
+  # Override actions to add a custom one
+  @impl PyreClient.Config
+  def list_actions do
+    PyreClient.Config.included_actions() ++ [
+      %{
+        module: MyApp.Actions.Deploy,
+        name: "deploy",
+        label: "Deploy",
+        description: "Deploy to staging/production"
+      }
+    ]
+  end
+
+  @impl PyreClient.Config
+  def resolve_action("deploy"), do: {:ok, MyApp.Actions.Deploy}
+  def resolve_action(action_type), do: PyreClient.Config.resolve_action(action_type)
 end
 
 # config/config.exs
-config :pyre_client, llm_config: MyApp.LLMConfig
+config :pyre_client, config: MyApp.PyreClientConfig
 ```
 
+Only override the callbacks you need — unimplemented callbacks fall through to the defaults.
+
 ## Config Module: `PyreClient.Config`
+
+Unified configuration for all pyre_client behaviour overrides. Provides:
+
+1. **Static helpers** — Read connection settings from application env (server URL, capacity, etc.)
+2. **Overridable callbacks** — Backend listing/resolution, action listing/resolution, model resolution
+3. **Built-in defaults** — `included_backends/0` and `included_actions/0` for extending rather than replacing
+
+Host apps override via `config :pyre_client, config: MyApp.PyreClientConfig`.
 
 ```elixir
 defmodule PyreClient.Config do
   @moduledoc """
-  Reads PyreClient connection configuration from application env.
+  Unified configuration for pyre_client.
+
+  ## Static helpers
+
+  Connection settings read from application env:
+
+      PyreClient.Config.server_url()
+      PyreClient.Config.available_capacity()
+
+  ## Overridable callbacks
+
+  Backend and action configuration delegates to `config_module/0`:
+
+      PyreClient.Config.list_backends()
+      PyreClient.Config.default_backend()
+      PyreClient.Config.list_actions()
+      PyreClient.Config.resolve_action("prompt")
+      PyreClient.Config.resolve_model("standard", backend)
+
+  ## Custom overrides
+
+      defmodule MyApp.PyreClientConfig do
+        use PyreClient.Config
+
+        @impl PyreClient.Config
+        def list_backends do
+          PyreClient.Config.included_backends() ++ [
+            %{module: MyApp.LLM.Ollama, name: "ollama",
+              label: "Ollama", description: "Local Ollama"}
+          ]
+        end
+      end
+
+      config :pyre_client, config: MyApp.PyreClientConfig
   """
+
+  # --- Overridable callbacks ---
+
+  @callback list_backends() :: [map()]
+  @callback default_backend() :: module()
+  @callback list_actions() :: [map()]
+  @callback resolve_action(String.t()) :: {:ok, module()} | :error
+  @callback resolve_model(String.t(), module()) :: String.t()
+
+  @optional_callbacks [list_backends: 0, default_backend: 0,
+                       list_actions: 0, resolve_action: 1, resolve_model: 2]
+
+  defmacro __using__(_opts) do
+    quote do
+      @behaviour PyreClient.Config
+    end
+  end
+
+  @doc "Returns the configured override module, or this module as default."
+  def config_module do
+    Application.get_env(:pyre_client, :config, __MODULE__)
+  end
+
+  # --- Callback delegates ---
+
+  def list_backends, do: config_module().list_backends()
+  def default_backend, do: config_module().default_backend()
+  def list_actions, do: config_module().list_actions()
+  def resolve_action(action_type), do: config_module().resolve_action(action_type)
+  def resolve_model(tier, backend), do: config_module().resolve_model(tier, backend)
+
+  # --- Built-in defaults (non-overridable, used by custom configs to extend) ---
+
+  @doc "Built-in LLM backends. Use in custom configs to extend rather than replace."
+  def included_backends do
+    [
+      %{module: PyreClient.LLM.ReqLLM, name: "req_llm",
+        label: "ReqLLM", description: "API-based LLM calls via ReqLLM"},
+      %{module: PyreClient.LLM.ClaudeCLI, name: "claude_cli",
+        label: "Claude CLI", description: "Claude Code CLI subprocess"},
+      %{module: PyreClient.LLM.CursorCLI, name: "cursor_cli",
+        label: "Cursor CLI", description: "Cursor Agent CLI subprocess"},
+      %{module: PyreClient.LLM.CodexCLI, name: "codex_cli",
+        label: "Codex CLI", description: "OpenAI Codex CLI subprocess"}
+    ]
+  end
+
+  @doc "Built-in action types. Use in custom configs to extend rather than replace."
+  def included_actions do
+    [
+      %{module: PyreClient.Actions.Prompt, name: "prompt",
+        label: "Prompt", description: "Generic LLM prompt execution"},
+      %{module: PyreClient.Actions.GitPRSetup, name: "git_pr_setup",
+        label: "Git PR Setup", description: "LLM → parse → git → draft GitHub PR"},
+      %{module: PyreClient.Actions.GitShip, name: "git_ship",
+        label: "Git Ship", description: "LLM → parse → git → GitHub PR"},
+      %{module: PyreClient.Actions.GitReview, name: "git_review",
+        label: "Git Review", description: "LLM → parse verdict → git → GitHub comment"}
+    ]
+  end
+
+  # --- Default callback implementations ---
+
+  def list_backends(_), do: included_backends()
+
+  def default_backend(_) do
+    case Application.get_env(:pyre_client, :llm_backend) do
+      :claude_cli -> PyreClient.LLM.ClaudeCLI
+      :cursor_cli -> PyreClient.LLM.CursorCLI
+      :codex_cli -> PyreClient.LLM.CodexCLI
+      :req_llm -> PyreClient.LLM.ReqLLM
+      nil -> PyreClient.LLM.ReqLLM
+      module when is_atom(module) -> module
+    end
+  end
+
+  def list_actions(_), do: included_actions()
+
+  def resolve_action(action_type, _) do
+    case Enum.find(included_actions(), &(&1.name == action_type)) do
+      %{module: module} -> {:ok, module}
+      nil -> :error
+    end
+  end
+
+  @default_model_aliases %{
+    "fast" => "anthropic:claude-haiku-4-5",
+    "standard" => "anthropic:claude-sonnet-4-20250514",
+    "advanced" => "anthropic:claude-opus-4-20250514"
+  }
+
+  @doc """
+  Resolves a model tier string to a concrete model identifier.
+
+  The server sends tier names ("fast", "standard", "advanced") in
+  action payloads. Each client resolves them to backend-appropriate
+  model strings. CLI backends further map these internally (e.g.,
+  ClaudeCLI maps "anthropic:claude-haiku-4-5" → "haiku").
+
+  Override via `config :pyre_client, :model_aliases, %{...}`.
+  """
+  def resolve_model(tier, _backend) when is_binary(tier) do
+    aliases = Application.get_env(:pyre_client, :model_aliases, @default_model_aliases)
+    Map.get(aliases, tier, tier)
+  end
+
+  def resolve_model(nil, _backend), do: resolve_model("standard", nil)
+
+  # --- Static helpers (not overridable) ---
 
   def server_url do
     Application.get_env(:pyre_client, :server_url, "ws://localhost:4000/pyre/websocket")
@@ -239,7 +409,7 @@ defmodule PyreClient.Config do
   end
 
   def backends do
-    PyreClient.LLM.Config.list_backends() |> Enum.map(& &1.name)
+    list_backends() |> Enum.map(& &1.name)
   end
 
   def enabled_workflows do
@@ -252,10 +422,6 @@ defmodule PyreClient.Config do
 
   def heartbeat_interval_ms do
     Application.get_env(:pyre_client, :heartbeat_interval_ms, 30_000)
-  end
-
-  def resolve_backend do
-    PyreClient.LLM.Config.default_backend()
   end
 
   defp generate_connection_id do
@@ -335,103 +501,6 @@ defmodule PyreClient.LLM do
       @impl PyreClient.LLM
       def manages_tool_loop?, do: false
       defoverridable manages_tool_loop?: 0
-    end
-  end
-end
-```
-
-## LLM Config Module: `PyreClient.LLM.Config`
-
-```elixir
-defmodule PyreClient.LLM.Config do
-  @moduledoc """
-  LLM backend configuration and resolution.
-
-  Host apps can override by implementing the callbacks and
-  configuring `config :pyre_client, llm_config: MyApp.LLMConfig`.
-  """
-
-  @callback list_backends() :: [map()]
-  @callback default_backend() :: module()
-
-  defmacro __using__(_opts) do
-    quote do
-      @behaviour PyreClient.LLM.Config
-    end
-  end
-
-  def config_module do
-    Application.get_env(:pyre_client, :llm_config, __MODULE__)
-  end
-
-  def list_backends do
-    config_module().list_backends()
-  end
-
-  @doc """
-  Returns the backend module configured for this client deployment.
-
-  The server does NOT specify which backend to use — each client
-  deployment is configured with its own backend via
-  `config :pyre_client, llm_backend: :claude_cli`. The server only
-  sends the model tier; the client resolves both backend and model.
-  """
-  def default_backend do
-    config_module().default_backend()
-  end
-
-  def included_backends do
-    [
-      %{module: PyreClient.LLM.ReqLLM, name: "req_llm",
-        label: "ReqLLM", description: "API-based LLM calls via ReqLLM"},
-      %{module: PyreClient.LLM.ClaudeCLI, name: "claude_cli",
-        label: "Claude CLI", description: "Claude Code CLI subprocess"},
-      %{module: PyreClient.LLM.CursorCLI, name: "cursor_cli",
-        label: "Cursor CLI", description: "Cursor Agent CLI subprocess"},
-      %{module: PyreClient.LLM.CodexCLI, name: "codex_cli",
-        label: "Codex CLI", description: "OpenAI Codex CLI subprocess"}
-    ]
-  end
-
-  # --- Model tier resolution ---
-  # The server sends a tier string ("fast", "standard", "advanced").
-  # The client resolves it to a backend-specific model string locally.
-
-  @default_model_aliases %{
-    "fast" => "anthropic:claude-haiku-4-5",
-    "standard" => "anthropic:claude-sonnet-4-20250514",
-    "advanced" => "anthropic:claude-opus-4-20250514"
-  }
-
-  @doc """
-  Resolves a model tier string to a concrete model identifier.
-
-  The server sends tier names ("fast", "standard", "advanced") in
-  action payloads. Each client resolves them to backend-appropriate
-  model strings. CLI backends further map these internally (e.g.,
-  ClaudeCLI maps "anthropic:claude-haiku-4-5" → "haiku").
-
-  Override via `config :pyre_client, :model_aliases, %{...}`.
-  """
-  def resolve_model(tier, _backend) when is_binary(tier) do
-    aliases = Application.get_env(:pyre_client, :model_aliases, @default_model_aliases)
-    Map.get(aliases, tier, tier)
-  end
-
-  def resolve_model(nil, _backend), do: resolve_model("standard", nil)
-
-  # Default callback implementations
-
-  def list_backends(_), do: included_backends()
-
-  def default_backend(_) do
-    case Application.get_env(:pyre_client, :llm_backend) do
-      :claude_cli -> PyreClient.LLM.ClaudeCLI
-      :cursor_cli -> PyreClient.LLM.CursorCLI
-      :codex_cli -> PyreClient.LLM.CodexCLI
-      :req_llm -> PyreClient.LLM.ReqLLM
-      nil -> PyreClient.LLM.ReqLLM
-      module when is_atom(module) -> module
     end
   end
 end

@@ -123,6 +123,13 @@ defmodule PyreClient.Actions do
   shell commands or arbitrary code. Each action module is a hardcoded
   implementation that decides what to execute locally. This ensures
   the client machine cannot be compromised via WebSocket access.
+
+  ## Extensibility
+
+  The default action registry covers all built-in action types.
+  Host apps can override resolution by providing a custom config
+  module via `config :pyre_client, config: MyApp.PyreClientConfig`.
+  See `PyreClient.Config` for details.
   """
 
   @type execution_context :: %{
@@ -148,15 +155,13 @@ defmodule PyreClient.Actions do
   @callback execute(payload :: map(), context :: execution_context()) ::
               {:ok, map()} | {:error, term()}
 
-  # --- Routing Registry ---
+  # --- Routing (delegates to Config) ---
+
+  @doc "List all registered action types."
+  defdelegate list_actions(), to: PyreClient.Config
 
   @doc "Resolve an action type string to its implementation module."
-  @spec resolve(String.t()) :: {:ok, module()} | :error
-  def resolve("prompt"), do: {:ok, PyreClient.Actions.Prompt}
-  def resolve("git_pr_setup"), do: {:ok, PyreClient.Actions.GitPRSetup}
-  def resolve("git_ship"), do: {:ok, PyreClient.Actions.GitShip}
-  def resolve("git_review"), do: {:ok, PyreClient.Actions.GitReview}
-  def resolve(_), do: :error
+  defdelegate resolve(action_type), to: PyreClient.Config, as: :resolve_action
 end
 ```
 
@@ -957,8 +962,8 @@ defmodule PyreClient.Runnerdo
     # resumption during action_continue.
     session_id = get_in(opts_map, ["session_id"])
 
-    backend = PyreClient.LLM.Config.default_backend()
-    model = PyreClient.LLM.Config.resolve_model(model_tier, backend)
+    backend = PyreClient.Config.default_backend()
+    model = PyreClient.Config.resolve_model(model_tier, backend)
 
     messages = Enum.map(messages, fn msg ->
       %{role: String.to_existing_atom(msg["role"]), content: msg["content"]}
@@ -1228,7 +1233,7 @@ Result: `{"text": "...", "verdict": "approve"}`
 
 ## Adding New Action Types
 
-Adding a new action type requires:
+### Built-in (modifying pyre_client itself)
 
 1. **Create the action module** in `lib/pyre_client/actions/`:
    ```elixir
@@ -1242,11 +1247,39 @@ Adding a new action type requires:
    end
    ```
 
-2. **Register it** in `PyreClient.Actions.resolve/1`:
+2. **Register it** in `PyreClient.Config.included_actions/0` and the default `resolve_action/2`:
    ```elixir
-   def resolve("new_type"), do: {:ok, PyreClient.Actions.NewType}
+   %{module: PyreClient.Actions.NewType, name: "new_type",
+     label: "New Type", description: "..."}
    ```
 
 3. **Add the server-side dispatch** in pyre_lib (the action module that builds the payload and interprets the result).
 
 Both libraries must be updated in lockstep. This is acceptable: there are no independent users, both are co-developed, and new action types are rare.
+
+### Host-app custom actions (via config)
+
+Host apps can add action types without modifying pyre_client:
+
+```elixir
+defmodule MyApp.PyreClientConfig do
+  use PyreClient.Config
+
+  @impl PyreClient.Config
+  def list_actions do
+    PyreClient.Config.included_actions() ++ [
+      %{module: MyApp.Actions.Deploy, name: "deploy",
+        label: "Deploy", description: "Deploy to staging/production"}
+    ]
+  end
+
+  @impl PyreClient.Config
+  def resolve_action("deploy"), do: {:ok, MyApp.Actions.Deploy}
+  def resolve_action(action_type), do: PyreClient.Config.resolve_action(action_type)
+end
+
+# config/config.exs
+config :pyre_client, config: MyApp.PyreClientConfig
+```
+
+The custom action module implements the same `PyreClient.Actions` behaviour. The server-side dispatch must also be configured to send the new action type.

@@ -81,7 +81,7 @@ defmodule PyreClient.Channel do
       "connection_id" => ch.connection_id,
       "status" => "active",
       "available_capacity" => PyreClient.Config.available_capacity(),
-      "backends" => PyreClient.LLM.Config.list_backends() |> Enum.map(& &1.name),
+      "backends" => PyreClient.Config.list_backends() |> Enum.map(& &1.name),
       "enabled_workflows" => PyreClient.Config.enabled_workflows(),
       "name" => PyreClient.Config.connection_name()
     }

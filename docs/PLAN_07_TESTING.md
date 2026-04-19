@@ -4,7 +4,7 @@
 
 Testing covers the full execution layer: WebSocket client, LLM backends, tool system, agentic loop, and session management. We use a layered approach:
 
-1. **Unit tests** — Protocol encoding/decoding, Channel state machine, LLM Config, Session
+1. **Unit tests** — Protocol encoding/decoding, Channel state machine, Config, Session
 2. **Tool tests** — Tool definitions, path validation, command sandboxing
 3. **Action module tests** — Actions behaviour routing, Prompt execution, Git utilities, GitHub API
 4. **Runner tests** — Action dispatch routing and LLM routing
@@ -300,6 +300,25 @@ defmodule PyreClient.ActionsTest do
     assert :error = Actions.resolve("unknown")
     assert :error = Actions.resolve("execute_commands")
   end
+
+  test "list_actions returns all built-in action types" do
+    actions = Actions.list_actions()
+    names = Enum.map(actions, & &1.name)
+
+    assert "prompt" in names
+    assert "git_pr_setup" in names
+    assert "git_ship" in names
+    assert "git_review" in names
+  end
+
+  test "included_actions returns action metadata maps" do
+    actions = PyreClient.Config.included_actions()
+
+    assert Enum.all?(actions, fn a ->
+      Map.has_key?(a, :module) and Map.has_key?(a, :name) and
+      Map.has_key?(a, :label) and Map.has_key?(a, :description)
+    end)
+  end
 end
 ```
 
@@ -487,14 +506,16 @@ defmodule PyreClient.LLM.ClaudeCLITest do
 end
 ```
 
-### LLM Config Tests
+### Config Tests
 
 ```elixir
-# test/pyre_client/llm/config_test.exs
-defmodule PyreClient.LLM.ConfigTest do
+# test/pyre_client/config_test.exs
+defmodule PyreClient.ConfigTest do
   use ExUnit.Case, async: false
 
-  alias PyreClient.LLM.Config
+  alias PyreClient.Config
+
+  # --- Backend callbacks ---
 
   test "included_backends returns all built-in backends" do
     backends = Config.included_backends()
@@ -515,6 +536,39 @@ defmodule PyreClient.LLM.ConfigTest do
   test "default_backend falls back to ReqLLM when not configured" do
     Application.delete_env(:pyre_client, :llm_backend)
     assert Config.default_backend() == PyreClient.LLM.ReqLLM
+  end
+
+  # --- Action callbacks ---
+
+  test "included_actions returns all built-in action types" do
+    actions = Config.included_actions()
+    names = Enum.map(actions, & &1.name)
+
+    assert "prompt" in names
+    assert "git_pr_setup" in names
+    assert "git_ship" in names
+    assert "git_review" in names
+  end
+
+  test "resolve_action returns correct modules" do
+    assert {:ok, PyreClient.Actions.Prompt} = Config.resolve_action("prompt")
+    assert {:ok, PyreClient.Actions.GitPRSetup} = Config.resolve_action("git_pr_setup")
+  end
+
+  test "resolve_action returns :error for unknown types" do
+    assert :error = Config.resolve_action("unknown")
+  end
+
+  # --- Model resolution ---
+
+  test "resolve_model maps tier to model string" do
+    assert Config.resolve_model("standard", nil) =~ "claude-sonnet"
+    assert Config.resolve_model("fast", nil) =~ "haiku"
+    assert Config.resolve_model("advanced", nil) =~ "opus"
+  end
+
+  test "resolve_model passes through unknown tiers" do
+    assert Config.resolve_model("custom-model", nil) == "custom-model"
   end
 end
 ```
@@ -658,7 +712,7 @@ end
 | `Runner` | Integration | No | MockServer (via Connection) |
 | `PyreClient.LLM.Mock` | Unit | No | Process dictionary |
 | `PyreClient.LLM.ClaudeCLI` | Unit | No | Application env |
-| `PyreClient.LLM.Config` | Unit | No | Application env |
+| `PyreClient.Config` | Unit | No | Application env |
 | `Connection` | Integration | No | MockServer (Phoenix) |
 
 ## What We Don't Test (Initially)
