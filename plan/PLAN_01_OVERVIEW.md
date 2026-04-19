@@ -56,8 +56,8 @@ All backend execution modules **move** from pyre_lib to pyre_client. The "Source
 | `Pyre.LLM.Mock` | `PyreClient.LLM.Mock` | Test mock (process dictionary) |
 | `Pyre.Tools` | `PyreClient.Tools` | Tool definitions (read_file, write_file, list_directory, run_command) |
 | `Pyre.Tools.AgenticLoop` | `PyreClient.Tools.AgenticLoop` | Multi-turn tool-use loop for ReqLLM backend |
-| `Pyre.Session` | `PyreClient.Session` | UUID session ID generation |
-| `Pyre.Session.Registry` | `PyreClient.Session.Registry` | Maps pyre session IDs to backend session IDs (CursorCLI) |
+| `Pyre.Session` | `PyreClient.Session` | Connection ID generation only (LLM session IDs come from server payloads) |
+| `Pyre.Session.Registry` | `PyreClient.Session.Registry` | Maps execution_id → session_id from server payloads; also maps pyre session IDs to backend session IDs (CursorCLI) |
 | _(new)_ | `PyreClient.LLM.Config` | Backend listing and resolution |
 | _(new)_ | `PyreClient.Config` | Connection settings |
 | _(new)_ | `PyreClient.Connection` | WebSockex WebSocket client |
@@ -184,19 +184,25 @@ The worker handles the full action lifecycle: LLM calls, response parsing, git o
 
 4. **Client-owned backend selection** — The server does NOT tell the client which backend to use. The server sends `model_tier` ("fast", "standard", "advanced"); the client resolves the backend from its own config (`config :pyre_client, llm_backend: :claude_cli`) and the model string from tier aliases. Each client deployment manages its own list of enabled backends. The server only sees the backends the client advertises in its join payload — it uses this for worker selection, not for directing backend choice.
 
-5. **Tools built locally** — Tool definitions include callbacks (functions) that can't be serialized over WebSocket. The Executor builds `ReqLLM.Tool` structs locally from role/working_dir info in the payload.
+5. **Server builds messages with personas** — The server loads persona files (`Pyre.Plugins.Persona`) and assembles the full messages array (system prompt + user message with artifacts/context) before dispatching. The client receives pre-built messages in the action payload and passes them directly to the LLM backend. The client never loads persona files or constructs system prompts — this keeps persona content server-side and avoids duplicating persona files across libraries.
 
-6. **`manages_tool_loop?` routing** — The Executor mirrors `Helpers.call_llm/4`'s routing: CLI backends handle tools internally, ReqLLM uses AgenticLoop.
+6. **Tools built locally** — Tool definitions include callbacks (functions) that can't be serialized over WebSocket. The Executor builds `ReqLLM.Tool` structs locally from the `role`, `working_dir`, `allowed_paths`, and `allowed_commands` fields in the payload via `PyreClient.Tools.for_role/3`.
 
-7. **Client owns action lifecycle** — The server sends named action types (`prompt`, `git_pr_setup`, `git_ship`, `git_review`) with data parameters. The client has hardcoded implementations for each type. The server never sends shell commands or arbitrary code. This is driven by a security constraint: if the server could send commands over WebSocket, anyone with WebSocket access could compromise the client machine. The client is rich in capability (LLM backends, git operations, GitHub API) but thin in architecture (no workflows, no flow state, no orchestration).
+7. **`manages_tool_loop?` routing** — The Executor mirrors `Helpers.call_llm/4`'s routing: CLI backends handle tools internally, ReqLLM uses AgenticLoop.
 
-8. **4 action types cover all current needs** — `prompt` handles 9 of 11 server-side actions (the 8 templates + QAReviewer). `git_pr_setup`, `git_ship`, and `git_review` handle the 3 side-effect outliers. New action types are rare and require lockstep updates to both libraries.
+8. **Client owns action lifecycle** — The server sends named action types (`prompt`, `git_pr_setup`, `git_ship`, `git_review`) with data parameters. The client has hardcoded implementations for each type. The server never sends shell commands or arbitrary code. This is driven by a security constraint: if the server could send commands over WebSocket, anyone with WebSocket access could compromise the client machine. The client is rich in capability (LLM backends, git operations, GitHub API) but thin in architecture (no workflows, no flow state, no orchestration).
 
-9. **WebSockex + Phoenix V2 protocol** — OTP-compatible WebSocket client speaking the channel wire format directly.
+9. **4 action types cover all current needs** — `prompt` handles 9 of 11 server-side actions (the 8 templates + QAReviewer). `git_pr_setup`, `git_ship`, and `git_review` handle the 3 side-effect outliers. New action types are rare and require lockstep updates to both libraries.
 
-10. **Library, not application** — No auto-start. Host app configures and starts processes.
+10. **Server owns session IDs** — The server generates session IDs (UUIDs) for each flow phase at run start via `Pyre.Session.generate_for_stages/1` and includes the relevant `session_id` in each action payload. The client stores the mapping (`execution_id → session_id`) so it can resume CLI sessions during `action_continue`. The client does NOT generate session IDs for LLM sessions — only for its own `connection_id`.
 
-11. **Capacity hardcoded to 1** — `max_capacity` is 1 for now. Dynamic capacity negotiation (notifying the server when slots free up, rejecting over-capacity dispatches) is deferred. Infrastructure for future concurrency stays in place.
+11. **Server signals interactivity** — The server includes `interactive: true|false` in each action payload. This is the authoritative signal that determines client behavior: if `true`, the client sends `action_result` (stays alive, holds capacity) after the initial LLM call and blocks for `action_continue`/`action_finish`. If `false`, the client sends `action_complete` (frees capacity) and exits. The client never decides interactivity on its own — the server's flow orchestration owns this decision.
+
+12. **WebSockex + Phoenix V2 protocol** — OTP-compatible WebSocket client speaking the channel wire format directly.
+
+13. **Library, not application** — No auto-start. Host app configures and starts processes.
+
+14. **Capacity hardcoded to 1** — `max_capacity` is 1 for now. Dynamic capacity negotiation (notifying the server when slots free up, rejecting over-capacity dispatches) is deferred. Infrastructure for future concurrency stays in place.
 
 ## Stages
 
@@ -209,6 +215,8 @@ The worker handles the full action lifecycle: LLM calls, response parsing, git o
 | 5 | `PLAN_05_CHANNEL_CLIENT.md` | Channel join, presence, message handling |
 | 6 | `PLAN_06_EXECUTOR.md` | Action dispatch, LLM routing, output streaming |
 | 7 | `PLAN_07_TESTING.md` | Test strategy and mock patterns |
+| 8 | `PLAN_08_SERVER_CHANGES.md` | pyre_lib/pyre_web changes for remote dispatch |
+| 9 | `PLAN_09_NATIVE_ALIGNMENT.md` | pyre_native changes to align with the new protocol |
 
 ## Dependency Graph
 
@@ -235,4 +243,4 @@ When pyre_client is built, pyre_lib will need these changes (done separately):
 6. **Update `Pyre.Config`** — Remove `list_llm_backends/0`, `get_llm_backend/1` (backend selection is entirely owned by pyre_client — each client deployment configures its own backends)
 7. **Potential orchestration-level LLM** — If pyre_lib needs lightweight LLM calls for orchestration (summarizing, parsing for tool orchestration), it would have its own simple, independent implementation — not shared with pyre_client
 
-These changes are **not part of the pyre_client build**.
+These changes are **done in separate phases from the pyre_client build**.

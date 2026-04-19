@@ -41,8 +41,8 @@ pyre_client/
 │   │   │   ├── git.ex                 # PyreClient.Actions.Git — shared git/parsing utilities
 │   │   │   └── github.ex              # PyreClient.Actions.GitHub — lightweight GitHub API client
 │   │   └── session/
-│   │       ├── session.ex             # PyreClient.Session — UUID generation
-│   │       └── registry.ex            # PyreClient.Session.Registry — backend ID mapping
+│   │       ├── session.ex             # PyreClient.Session — connection ID generation only
+│   │       └── registry.ex            # PyreClient.Session.Registry — maps execution_id → session_id from server payloads
 └── test/
     ├── test_helper.exs
     ├── pyre_client/
@@ -495,7 +495,6 @@ end
 # my_pyre_worker/lib/my_pyre_worker/application.ex
 def start(_type, _args) do
   children = [
-    PyreClient.Session.Registry,
     PyreClient.Executor,
     PyreClient.Connection
   ]
