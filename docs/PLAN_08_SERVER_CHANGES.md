@@ -625,7 +625,7 @@ run_action(SoftwareArchitect, ...)
   │   {:action, exec_id, payload}       ├─► Channel.handle_info
   │                                     │   push("action", payload) ──────────► Connection receives
   │                                     │                                       Channel.handle_message
-  │                                     │                                       Executor.handle_action
+  │                                     │                                       Runner.handle_action
   │                                     │                                         │
   │   [receive loop]                    │                                         ├─ resolve backend
   │     │                               │                                         ├─ build tools
@@ -655,7 +655,7 @@ run_action(Programmer, ...)
   │
   ├─ build payload (interactive: true)
   ├─ subscribe, dispatch
-  │                                                              Executor receives
+  │                                                              Runner receives
   │   [receive loop]                                               │
   │     ◄── {:action_output, ...} ◄──────────────────────────────┤── stream tokens
   │     ◄── {:action_result, ...} ◄──────────────────────────────┤── initial result
@@ -677,7 +677,7 @@ run_action(Programmer, ...)
   │   ├─ broadcast ──────────────────► {:action_continue, exec_id, %{"message" => "add..."}}
   │   │                                     │
   │   │                                     ├─► Channel pushes "action_continue" ──► Worker
-  │   │                                     │                                        Executor forwards
+  │   │                                     │                                        Runner forwards
   │   │                                     │                                        to blocked process
   │   │   [receive loop]                    │                                        │
   │   │     ◄── {:action_output} ◄──────────┤◄───────────────────────────────────────┤── resume session
@@ -714,7 +714,7 @@ run_action(Programmer, ...)
 
 All messages within a single execution (dispatch, streaming, interactive replies, finalize, finish) go to the **same worker** via the `connection_id` stored in RunServer state at flow start.
 
-- **Within a stage:** The `execution_id` identifies the worker's spawned process. `action_continue` and `action_finish` messages are routed by `execution_id` within the Executor. The same worker is guaranteed because the flow always broadcasts to the same `connection_id`.
+- **Within a stage:** The `execution_id` identifies the worker's spawned process. `action_continue` and `action_finish` messages are routed by `execution_id` within the Runner. The same worker is guaranteed because the flow always broadcasts to the same `connection_id`.
 
 - **Across stages:** All stages in a single run use the same `connection_id`. This is required because:
   1. CLI session resumption (`--resume <session_id>`) requires the session file to exist on the worker's filesystem.

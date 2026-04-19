@@ -34,7 +34,7 @@ The current `execute_commands` action type — where the server sends arbitrary 
 | Inbound events | `"action"`, `"action_continue"`, `"action_finish"` |
 | Action types | `"prompt"`, `"git_pr_setup"`, `"git_ship"`, `"git_review"` — same as pyre_client |
 | Outbound events | `"action_output"`, `"action_result"`, `"action_complete"` — aligned payloads |
-| Capacity | Tracked by NativeExecutor, advertised via presence metadata |
+| Capacity | Tracked by NativeRunner, advertised via presence metadata |
 | Interactive | Full support via `action_result` → `action_continue` → `action_finish` loop |
 
 ### What gets removed
@@ -42,7 +42,7 @@ The current `execute_commands` action type — where the server sends arbitrary 
 | Item | Reason |
 |------|--------|
 | `"execute_commands"` action type | Security: server must never send arbitrary shell commands |
-| `RemoteCommandService` | Replaced by `NativeExecutor` + action handler modules |
+| `RemoteCommandService` | Replaced by `NativeRunner` + action handler modules |
 | `payload["type"]` dispatch key | Replaced by `payload["action"]` (aligned with pyre_client) |
 | `"line"` key in action_output | Replaced by `"content"` (aligned with pyre_client) |
 | `"exit_codes"` in action_complete | Replaced by `"status"` + `"result"` map (aligned with pyre_client) |
@@ -79,8 +79,8 @@ params["connection_id"] = info.connectionId
 
 // New fields — align with pyre_client's PyreClient.Config
 params["status"] = "active"
-params["available_capacity"] = NativeExecutor.shared.availableCapacity
-params["backends"] = NativeExecutor.shared.supportedBackends
+params["available_capacity"] = NativeRunner.shared.availableCapacity
+params["backends"] = NativeRunner.shared.supportedBackends
 params["enabled_workflows"] = []  // empty = all
 
 // Produces:
@@ -130,7 +130,7 @@ newChannel.on("action") { [weak newChannel] payload in
           let innerPayload = payload["payload"] as? [String: Any]
     else { return }
 
-    NativeExecutor.shared.dispatch(
+    NativeRunner.shared.dispatch(
         executionId: executionId,
         actionType: actionType,
         payload: innerPayload,
@@ -140,18 +140,18 @@ newChannel.on("action") { [weak newChannel] payload in
 
 newChannel.on("action_continue") { payload in
     guard let executionId = payload["execution_id"] as? String else { return }
-    NativeExecutor.shared.handleContinue(executionId: executionId, payload: payload)
+    NativeRunner.shared.handleContinue(executionId: executionId, payload: payload)
 }
 
 newChannel.on("action_finish") { payload in
     guard let executionId = payload["execution_id"] as? String else { return }
-    NativeExecutor.shared.handleFinish(executionId: executionId)
+    NativeRunner.shared.handleFinish(executionId: executionId)
 }
 ```
 
 **Key changes:**
 - Top-level dispatch key: `"action"` (not `"type"`)
-- Routes to `NativeExecutor` (not `RemoteCommandService`)
+- Routes to `NativeRunner` (not `RemoteCommandService`)
 - Registers handlers for `action_continue` and `action_finish` (interactive loop)
 
 ---
@@ -230,16 +230,16 @@ Same wire format as pyre_client receives. On `action_continue`, the native clien
 
 ---
 
-## Change 4: NativeExecutor Service
+## Change 4: NativeRunner Service
 
-Replaces `RemoteCommandService`. Mirrors pyre_client's `PyreClient.Executor` pattern: action routing, capacity tracking, interactive loop infrastructure.
+Replaces `RemoteCommandService`. Mirrors pyre_client's `PyreClient.Runner` pattern: action routing, capacity tracking, interactive loop infrastructure.
 
 ```swift
 /// Routes dispatched actions to handler modules, tracks capacity, and
-/// manages the interactive loop. Mirrors PyreClient.Executor's role.
+/// manages the interactive loop. Mirrors PyreClient.Runner's role.
 @MainActor
-final class NativeExecutor: ObservableObject {
-    static let shared = NativeExecutor()
+final class NativeRunner: ObservableObject {
+    static let shared = NativeRunner()
 
     @Published private(set) var activeExecution: ActiveExecution?
     @Published private(set) var isRunning = false
@@ -269,7 +269,7 @@ final class NativeExecutor: ObservableObject {
         channel: PhoenixChannelLiveView
     ) {
         guard !isRunning else {
-            DebugLogger.warning("NativeExecutor at capacity, rejecting \(executionId)")
+            DebugLogger.warning("NativeRunner at capacity, rejecting \(executionId)")
             channel.pushAsync("action_complete", [
                 "execution_id": executionId,
                 "status": "error",
@@ -304,7 +304,7 @@ final class NativeExecutor: ObservableObject {
                 executionId: executionId,
                 payload: payload,
                 channel: channel,
-                executor: self
+                runner: self
             )
         }
     }
@@ -379,7 +379,7 @@ protocol NativeActionHandler {
         executionId: String,
         payload: [String: Any],
         channel: PhoenixChannelLiveView,
-        executor: NativeExecutor
+        runner: NativeRunner
     ) async
 }
 ```
@@ -410,7 +410,7 @@ struct PromptActionHandler: NativeActionHandler {
         executionId: String,
         payload: [String: Any],
         channel: PhoenixChannelLiveView,
-        executor: NativeExecutor
+        runner: NativeRunner
     ) async {
         let messages = payload["messages"] as? [[String: Any]] ?? []
         let opts = payload["opts"] as? [String: Any] ?? [:]
@@ -444,11 +444,11 @@ struct PromptActionHandler: NativeActionHandler {
             )
 
             guard status.isSuccess else {
-                await sendError(executionId: executionId, reason: "CLI exited with error", channel: channel, executor: executor)
+                await sendError(executionId: executionId, reason: "CLI exited with error", channel: channel, runner: runner)
                 return
             }
         } catch {
-            await sendError(executionId: executionId, reason: error.localizedDescription, channel: channel, executor: executor)
+            await sendError(executionId: executionId, reason: error.localizedDescription, channel: channel, runner: runner)
             return
         }
 
@@ -464,7 +464,7 @@ struct PromptActionHandler: NativeActionHandler {
                 sessionId: sessionId,
                 workingDir: workingDir,
                 channel: channel,
-                executor: executor,
+                runner: runner,
                 lastText: resultText
             )
         } else {
@@ -475,26 +475,26 @@ struct PromptActionHandler: NativeActionHandler {
                 "result": ["text": resultText]
             ])
             await MainActor.run {
-                executor.executionComplete(executionId: executionId, channel: channel)
+                runner.executionComplete(executionId: executionId, channel: channel)
             }
         }
     }
 
     // MARK: - Interactive Loop
 
-    /// Mirrors pyre_client's Executor interactive_loop.
+    /// Mirrors pyre_client's Runner interactive_loop.
     /// Blocks until action_finish, resuming CLI sessions on action_continue.
     private func interactiveLoop(
         executionId: String,
         sessionId: String?,
         workingDir: String?,
         channel: PhoenixChannelLiveView,
-        executor: NativeExecutor,
+        runner: NativeRunner,
         lastText: String
     ) async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             Task { @MainActor in
-                executor.activeExecution?.continuationHandler = { payload in
+                runner.activeExecution?.continuationHandler = { payload in
                     let userMessage = payload["message"] as? String ?? ""
 
                     Task {
@@ -532,14 +532,14 @@ struct PromptActionHandler: NativeActionHandler {
                     }
                 }
 
-                executor.activeExecution?.finishHandler = {
+                runner.activeExecution?.finishHandler = {
                     channel.pushAsync("action_complete", [
                         "execution_id": executionId,
                         "status": "ok",
                         "result": ["text": lastText]
                     ])
                     Task { @MainActor in
-                        executor.executionComplete(executionId: executionId, channel: channel)
+                        runner.executionComplete(executionId: executionId, channel: channel)
                     }
                     continuation.resume()
                 }
@@ -579,7 +579,7 @@ struct PromptActionHandler: NativeActionHandler {
         executionId: String,
         reason: String,
         channel: PhoenixChannelLiveView,
-        executor: NativeExecutor
+        runner: NativeRunner
     ) async {
         channel.pushAsync("action_complete", [
             "execution_id": executionId,
@@ -587,7 +587,7 @@ struct PromptActionHandler: NativeActionHandler {
             "result": ["error": reason]
         ])
         await MainActor.run {
-            executor.executionComplete(executionId: executionId, channel: channel)
+            runner.executionComplete(executionId: executionId, channel: channel)
         }
     }
 }
@@ -618,13 +618,13 @@ All git operations use `ShellExecutor.run()` (non-streaming) to execute `git` co
 
 | File | Why |
 |------|-----|
-| `Services/RemoteCommandService.swift` | Replaced by NativeExecutor + action handlers. Arbitrary command execution is removed. |
+| `Services/RemoteCommandService.swift` | Replaced by NativeRunner + action handlers. Arbitrary command execution is removed. |
 
 ### Files to add
 
 | File | Purpose |
 |------|---------|
-| `Services/NativeExecutor.swift` | Action routing, capacity tracking, interactive loop infrastructure |
+| `Services/NativeRunner.swift` | Action routing, capacity tracking, interactive loop infrastructure |
 | `Services/Actions/PromptActionHandler.swift` | `"prompt"` action — Claude CLI subprocess |
 | `Services/Actions/GitPRSetupActionHandler.swift` | `"git_pr_setup"` action — CLI + git + GitHub |
 | `Services/Actions/GitShipActionHandler.swift` | `"git_ship"` action — CLI + git + GitHub |
@@ -635,8 +635,8 @@ All git operations use `ShellExecutor.run()` (non-streaming) to execute `git` co
 
 | File | Change |
 |------|--------|
-| `Services/ConnectionPresenceService.swift` | Updated join payload, dispatch to NativeExecutor, register `action_continue`/`action_finish` handlers |
-| `Views/Pages/HomeView.swift` | Replace `@ObservedObject remoteCommands` with `@ObservedObject executor: NativeExecutor` |
+| `Services/ConnectionPresenceService.swift` | Updated join payload, dispatch to NativeRunner, register `action_continue`/`action_finish` handlers |
+| `Views/Pages/HomeView.swift` | Replace `@ObservedObject remoteCommands` with `@ObservedObject runner: NativeRunner` |
 
 ### Files unchanged
 
@@ -650,7 +650,7 @@ All git operations use `ShellExecutor.run()` (non-streaming) to execute `git` co
 
 ## Change 7: HomeView Updates
 
-Replace `RemoteCommandService` observation with `NativeExecutor`.
+Replace `RemoteCommandService` observation with `NativeRunner`.
 
 ### Before
 
@@ -667,14 +667,14 @@ if remoteCommands.isRunning { Button("Stop") { remoteCommands.stop() } }
 
 ```swift
 #if os(macOS)
-@ObservedObject private var executor = NativeExecutor.shared
+@ObservedObject private var runner = NativeRunner.shared
 #endif
 
-if let execution = executor.activeExecution { ... }
-if executor.isRunning { Button("Stop") { /* TODO: cancel active execution */ } }
+if let execution = runner.activeExecution { ... }
+if runner.isRunning { Button("Stop") { /* TODO: cancel active execution */ } }
 ```
 
-The local command text field (manual shell execution for debugging) can stay as a local-only debug tool — it doesn't go through the server or NativeExecutor.
+The local command text field (manual shell execution for debugging) can stay as a local-only debug tool — it doesn't go through the server or NativeRunner.
 
 ---
 
@@ -683,7 +683,7 @@ The local command text field (manual shell execution for debugging) can stay as 
 ```
 Pyre/
 ├── Services/
-│   ├── NativeExecutor.swift                 # NEW — action routing, capacity, interactive loop
+│   ├── NativeRunner.swift                 # NEW — action routing, capacity, interactive loop
 │   ├── Actions/                             # NEW directory
 │   │   ├── PromptActionHandler.swift        # NEW — "prompt" via Claude CLI
 │   │   ├── GitPRSetupActionHandler.swift    # NEW — "git_pr_setup" via CLI + git
@@ -701,7 +701,7 @@ Pyre/
 │   └── Connections.swift                    # UNCHANGED
 └── Views/
     └── Pages/
-        └── HomeView.swift                   # MODIFIED — observe NativeExecutor
+        └── HomeView.swift                   # MODIFIED — observe NativeRunner
 ```
 
 ---
@@ -723,7 +723,7 @@ Both workers are peers from the server's perspective. Same action types, same wi
 | **action_complete** | `{execution_id, status, result}` | `{execution_id, status, result}` |
 | **action_continue** | Resumes LLM session via Elixir backend | Resumes Claude CLI session via `--resume` |
 | **action_finish** | Post-processing (git ops if git action) | Post-processing (git ops if git action) |
-| **Interactive loop** | Executor GenServer `receive` loop | CheckedContinuation-based async blocking |
+| **Interactive loop** | Runner GenServer `receive` loop | CheckedContinuation-based async blocking |
 | **Session resume** | `--session-id` / `--resume` flags on CLI subprocess | Same flags, same CLI |
 | **Tool execution** | `ReqLLM.Tool` structs → AgenticLoop (ReqLLM) or CLI-managed (ClaudeCLI) | CLI manages its own tool loop (`manages_tool_loop? = true` equivalent) |
 
@@ -777,18 +777,18 @@ This is backward compatible during the transition.
 | iOS action support | **Future** | iOS has no CLI access. Could support notification or file-based actions. |
 | Multiple backend support | **Future** | Currently Claude CLI only. Could add Cursor CLI, Codex CLI. |
 | Command allowlists for git ops | **Future** | Git operations are hardcoded in handlers, not arbitrary. Low risk. |
-| Capacity > 1 | **Future** | Infrastructure in place (NativeExecutor tracks active count). |
+| Capacity > 1 | **Future** | Infrastructure in place (NativeRunner tracks active count). |
 
 ---
 
 ## Implementation Order
 
 1. **Add `NativeActionHandler` protocol** — `Protocols/NativeActionHandler.swift`
-2. **Add `NativeExecutor`** — `Services/NativeExecutor.swift` (routing, capacity, interactive loop infrastructure)
-3. **Update `ConnectionPresenceService`** — New join payload fields, dispatch to NativeExecutor, register `action_continue`/`action_finish` handlers
+2. **Add `NativeRunner`** — `Services/NativeRunner.swift` (routing, capacity, interactive loop infrastructure)
+3. **Update `ConnectionPresenceService`** — New join payload fields, dispatch to NativeRunner, register `action_continue`/`action_finish` handlers
 4. **Add `PromptActionHandler` stub** — `Services/Actions/PromptActionHandler.swift` (compiles, routes correctly, returns "not yet implemented" error)
 5. **Add `GitPRSetupActionHandler` / `GitShipActionHandler` / `GitReviewActionHandler` stubs** — Same pattern
-6. **Update `HomeView`** — Observe NativeExecutor instead of RemoteCommandService
+6. **Update `HomeView`** — Observe NativeRunner instead of RemoteCommandService
 7. **Remove `RemoteCommandService`** — Fully replaced
 8. **Update server LiveViews** — Accept `"content"` key in action_output alongside `"line"`
 9. **Implement `PromptActionHandler`** — CLI arg building, subprocess streaming, session resume

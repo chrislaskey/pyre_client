@@ -7,7 +7,7 @@ Testing covers the full execution layer: WebSocket client, LLM backends, tool sy
 1. **Unit tests** — Protocol encoding/decoding, Channel state machine, LLM Config, Session
 2. **Tool tests** — Tool definitions, path validation, command sandboxing
 3. **Action module tests** — Actions behaviour routing, Prompt execution, Git utilities, GitHub API
-4. **Executor tests** — Action dispatch routing and LLM routing
+4. **Runner tests** — Action dispatch routing and LLM routing
 5. **LLM backend tests** — Mock backend, ClaudeCLI (with overridden executable)
 6. **Integration tests** — Connection against a real (minimal) Phoenix endpoint
 
@@ -385,9 +385,9 @@ defmodule PyreClient.Actions.PromptTest do
 end
 ```
 
-## Layer 4: Executor Tests
+## Layer 4: Runner Tests
 
-The Executor is a GenServer that spawns execution processes. Testing the full dispatch flow requires the Connection process (for `send_to_server`), so executor tests are deferred to the integration layer. The action routing logic is tested via the Actions registry tests above. The LLM routing logic is exercised indirectly through the LLM backend tests and AgenticLoop tests.
+The Runner is a GenServer that spawns execution processes. Testing the full dispatch flow requires the Connection process (for `send_to_server`), so runner tests are deferred to the integration layer. The action routing logic is tested via the Actions registry tests above. The LLM routing logic is exercised indirectly through the LLM backend tests and AgenticLoop tests.
 
 ## Layer 4: LLM Backend Tests
 
@@ -655,7 +655,7 @@ end
 | `Actions.GitPRSetup` | Integration | No | Mock LLM, git, GitHub |
 | `Actions.GitShip` | Integration | No | Mock LLM, git, GitHub |
 | `Actions.GitReview` | Integration | No | Mock LLM, git, GitHub |
-| `Executor` | Integration | No | MockServer (via Connection) |
+| `Runner` | Integration | No | MockServer (via Connection) |
 | `PyreClient.LLM.Mock` | Unit | No | Process dictionary |
 | `PyreClient.LLM.ClaudeCLI` | Unit | No | Application env |
 | `PyreClient.LLM.Config` | Unit | No | Application env |

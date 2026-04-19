@@ -30,7 +30,7 @@ pyre_lib (orchestration + UI)               pyre_client (execution)
 ├── Pyre.Flows.*     (workflow pipelines)   ├── PyreClient.LLM.*     (all backends)
 ├── Pyre.Actions.*   (action definitions)   ├── PyreClient.Tools.*   (tool sandbox + agentic loop)
 ├── Pyre.RunServer   (run lifecycle)        ├── PyreClient.Session.* (session management)
-├── Pyre.Config      (workflow config)      ├── PyreClient.Executor  (action execution)
+├── Pyre.Config      (workflow config)      ├── PyreClient.Runner  (action execution)
 ├── PyreWeb.*        (UI, channels)         ├── PyreClient.Connection (WebSocket)
 └── depends on: jido, jido_ai              └── depends on: req_llm, websockex
          │                                           │
@@ -63,7 +63,7 @@ All backend execution modules **move** from pyre_lib to pyre_client. The "Source
 | _(new)_ | `PyreClient.Connection` | WebSockex WebSocket client |
 | _(new)_ | `PyreClient.Channel` | Phoenix channel state machine |
 | _(new)_ | `PyreClient.Protocol` | Phoenix V2 wire protocol |
-| _(new)_ | `PyreClient.Executor` | Action dispatch and execution |
+| _(new)_ | `PyreClient.Runner` | Action dispatch and execution |
 | _(new)_ | `PyreClient.Actions` | Action behaviour + routing registry |
 | _(new)_ | `PyreClient.Actions.Prompt` | LLM call → return text (covers 9 of 11 server actions) |
 | _(new)_ | `PyreClient.Actions.GitPRSetup` | LLM → parse → git → draft GitHub PR |
@@ -114,7 +114,7 @@ When pyre_lib dispatches an action to a worker, it sends a named action type wit
 pyre_lib (server)                    pyre_client (worker)
 ─────────────────                    ────────────────────
 Flow.run_action()
-  → dispatch {action: "prompt"}      → Executor receives payload
+  → dispatch {action: "prompt"}      → Runner receives payload
     {model_tier, messages,              → Actions.resolve("prompt")
      role, working_dir,                 → Actions.Prompt.execute()
      interactive: false, ...}             → resolve backend, model, tools
@@ -131,7 +131,7 @@ Flow.run_action()
 pyre_lib (server)                    pyre_client (worker)
 ─────────────────                    ────────────────────
 Flow.run_action()
-  → dispatch {action: "git_pr_setup"}  → Executor receives payload
+  → dispatch {action: "git_pr_setup"}  → Runner receives payload
     {messages, github creds,              → Actions.resolve("git_pr_setup")
      working_dir, ...}                    → Actions.GitPRSetup.execute()
                                             → LLM call (persona: shipper)
@@ -150,7 +150,7 @@ Flow.run_action()
 pyre_lib (server)                    pyre_client (worker)
 ─────────────────                    ────────────────────
 Flow.run_action()
-  → dispatch {action: "prompt",      → Executor receives payload
+  → dispatch {action: "prompt",      → Runner receives payload
      interactive: true, ...}            → Action module runs LLM call
   ← streams action_output             ← streams tokens/lines
   ← receives action_result            ← sends result (NOT complete)
@@ -186,9 +186,9 @@ The worker handles the full action lifecycle: LLM calls, response parsing, git o
 
 5. **Server builds messages with personas** — The server loads persona files (`Pyre.Plugins.Persona`) and assembles the full messages array (system prompt + user message with artifacts/context) before dispatching. The client receives pre-built messages in the action payload and passes them directly to the LLM backend. The client never loads persona files or constructs system prompts — this keeps persona content server-side and avoids duplicating persona files across libraries.
 
-6. **Tools built locally** — Tool definitions include callbacks (functions) that can't be serialized over WebSocket. The Executor builds `ReqLLM.Tool` structs locally from the `role`, `working_dir`, `allowed_paths`, and `allowed_commands` fields in the payload via `PyreClient.Tools.for_role/3`.
+6. **Tools built locally** — Tool definitions include callbacks (functions) that can't be serialized over WebSocket. The Runner builds `ReqLLM.Tool` structs locally from the `role`, `working_dir`, `allowed_paths`, and `allowed_commands` fields in the payload via `PyreClient.Tools.for_role/3`.
 
-7. **`manages_tool_loop?` routing** — The Executor mirrors `Helpers.call_llm/4`'s routing: CLI backends handle tools internally, ReqLLM uses AgenticLoop.
+7. **`manages_tool_loop?` routing** — The Runner mirrors `Helpers.call_llm/4`'s routing: CLI backends handle tools internally, ReqLLM uses AgenticLoop.
 
 8. **Client owns action lifecycle** — The server sends named action types (`prompt`, `git_pr_setup`, `git_ship`, `git_review`) with data parameters. The client has hardcoded implementations for each type. The server never sends shell commands or arbitrary code. This is driven by a security constraint: if the server could send commands over WebSocket, anyone with WebSocket access could compromise the client machine. The client is rich in capability (LLM backends, git operations, GitHub API) but thin in architecture (no workflows, no flow state, no orchestration).
 
@@ -225,7 +225,7 @@ Stage 2 (project structure + LLM layer + tools + sessions)
   └─→ Stage 3 (protocol layer — pure, no deps)
        └─→ Stage 4 (websocket connection)
             └─→ Stage 5 (channel client)
-                 └─→ Stage 6 (executor — command + LLM execution)
+                 └─→ Stage 6 (runner — command + LLM execution)
                       └─→ Stage 7 (tests)
 ```
 

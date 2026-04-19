@@ -9,9 +9,9 @@
 1. Join `pyre:connections` with worker metadata on connect
 2. Track channel join state (joining → joined → left)
 3. Handle `phx_reply` to join requests
-4. Handle `action` pushes from the server (dispatch to Executor)
-5. Handle `action_continue` pushes (forward to blocked execution process via Executor)
-6. Handle `action_finish` pushes (signal execution to release via Executor)
+4. Handle `action` pushes from the server (dispatch to Runner)
+5. Handle `action_continue` pushes (forward to blocked execution process via Runner)
+6. Handle `action_finish` pushes (signal execution to release via Runner)
 7. Handle `presence_diff` events
 8. Send `action_output`, `action_result`, `action_complete`, `update_metadata` messages
 
@@ -28,7 +28,7 @@ defmodule PyreClient.Channel do
 
   alias PyreClient.Protocol
   alias PyreClient.Protocol.Message
-  alias PyreClient.Executor
+  alias PyreClient.Runner
 
   require Logger
 
@@ -101,7 +101,7 @@ defmodule PyreClient.Channel do
   @spec on_disconnected(t()) :: t()
   def on_disconnected(%__MODULE__{} = ch) do
     # Notify worker of disconnection so it can clean up any in-flight executions
-    Executor.on_disconnected()
+    Runner.on_disconnected()
 
     %{ch |
       status: :disconnected,
@@ -136,8 +136,8 @@ defmodule PyreClient.Channel do
   ) do
     Logger.info("[PyreClient.Channel] Received action: #{payload["action"]} (#{payload["execution_id"]})")
 
-    # Delegate to executor — it will send frames back via Connection casts
-    Executor.handle_action(payload)
+    # Delegate to runner — it will send frames back via Connection casts
+    Runner.handle_action(payload)
 
     {[], ch}
   end
@@ -148,7 +148,7 @@ defmodule PyreClient.Channel do
     %{status: :joined} = ch
   ) do
     Logger.info("[PyreClient.Channel] Received action_continue: #{payload["execution_id"]}")
-    Executor.handle_continue(payload)
+    Runner.handle_continue(payload)
     {[], ch}
   end
 
@@ -158,7 +158,7 @@ defmodule PyreClient.Channel do
     %{status: :joined} = ch
   ) do
     Logger.info("[PyreClient.Channel] Received action_finish: #{payload["execution_id"]}")
-    Executor.handle_finish(payload)
+    Runner.handle_finish(payload)
     {[], ch}
   end
 
@@ -244,7 +244,7 @@ defmodule PyreClient.Channel do
   @doc "Handle process messages forwarded from Connection."
   @spec handle_info(term(), t()) :: frames_and_state()
 
-  # Executor wants to send a message back to the server
+  # Runner wants to send a message back to the server
   def handle_info({:worker_send, event, payload}, ch) do
     send_event(ch, event, payload)
   end
@@ -297,12 +297,12 @@ When joining `pyre:connections`, the client sends its full worker metadata:
 
 This metadata is tracked by `PyreWeb.Presence` and read by host-app worker selectors (e.g., pyre_app's `QueueManager` and `WorkflowJob`) for dispatch routing.
 
-## How the Executor Sends Messages
+## How the Runner Sends Messages
 
-The Executor module runs commands in a spawned process. It sends messages back to the server by casting to the Connection process:
+The Runner module runs commands in a spawned process. It sends messages back to the server by casting to the Connection process:
 
 ```elixir
-# Inside Executor, running in a spawned process:
+# Inside Runner, running in a spawned process:
 WebSockex.cast(PyreClient.Connection, {:send_event, "action_output", %{
   "execution_id" => execution_id,
   "line" => "cloning repository..."

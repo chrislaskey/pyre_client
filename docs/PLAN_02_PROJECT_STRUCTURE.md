@@ -19,7 +19,7 @@ pyre_client/
 │   │   ├── connection.ex              # WebSockex client (Stage 4)
 │   │   ├── channel.ex                 # Channel protocol layer (Stage 5)
 │   │   ├── protocol.ex                # Phoenix V2 wire encoding/decoding (Stage 3)
-│   │   ├── executor.ex                # Action execution + output streaming (Stage 6)
+│   │   ├── runner.ex                # Action execution + output streaming (Stage 6)
 │   │   ├── config.ex                  # Client configuration
 │   │   ├── llm.ex                     # PyreClient.LLM behaviour
 │   │   ├── llm/
@@ -49,7 +49,7 @@ pyre_client/
     │   ├── connection_test.exs
     │   ├── channel_test.exs
     │   ├── protocol_test.exs
-    │   ├── executor_test.exs
+    │   ├── runner_test.exs
     │   ├── tools_test.exs
     │   ├── actions_test.exs
     │   ├── actions/
@@ -321,8 +321,8 @@ defmodule PyreClient.LLM do
   @doc """
   Returns true if this backend manages its own tool-use loop internally.
 
-  When true, the Executor calls `chat/4` directly with tools.
-  When false, the Executor routes through `PyreClient.Tools.AgenticLoop`.
+  When true, the Runner calls `chat/4` directly with tools.
+  When false, the Runner routes through `PyreClient.Tools.AgenticLoop`.
   """
   @callback manages_tool_loop?() :: boolean()
 
@@ -467,7 +467,7 @@ defmodule PyreClient do
 
       children = [
         PyreClient.Session.Registry,
-        PyreClient.Executor,
+        PyreClient.Runner,
         PyreClient.Connection
       ]
   """
@@ -495,7 +495,7 @@ end
 # my_pyre_worker/lib/my_pyre_worker/application.ex
 def start(_type, _args) do
   children = [
-    PyreClient.Executor,
+    PyreClient.Runner,
     PyreClient.Connection
   ]
 
@@ -505,10 +505,10 @@ end
 
 No `jido`, no workflow engine, no RunServer — just WebSocket + LLM backends + tools.
 
-### Embedded in pyre_app (alongside pyre_lib)
+### Embedded in host app (alongside pyre_lib)
 
 ```elixir
-# pyre_app/mix.exs — depends on BOTH pyre_lib and pyre_client
+# host_app/mix.exs — depends on BOTH pyre_lib and pyre_client
 defp deps do
   [
     {:pyre, path: "../pyre_lib"},           # Orchestration + UI
@@ -517,15 +517,15 @@ defp deps do
   ]
 end
 
-# pyre_app/lib/app/application.ex — add client to children
+# host_app/lib/app/application.ex — add client to children
 children = [
   # ... pyre_lib children (RunServer, etc.) ...
   PyreClient.Session.Registry,
-  PyreClient.Executor,
+  PyreClient.Runner,
   PyreClient.Connection
 ]
 
-# pyre_app/config/runtime.exs
+# host_app/config/runtime.exs
 config :pyre_client,
   server_url: "ws://localhost:#{System.get_env("PORT", "4000")}/pyre/websocket",
   connection_id: "local-worker",
@@ -534,4 +534,4 @@ config :pyre_client,
   llm_backend: :claude_cli
 ```
 
-When embedded in pyre_app, the client connects to the same server via localhost WebSocket. pyre_lib and pyre_client are in the same BEAM VM but have no compile-time coupling.
+When embedded in a host app, the client connects to the same server via localhost WebSocket. pyre_lib and pyre_client are in the same BEAM VM but have no compile-time coupling.

@@ -1,12 +1,12 @@
-# Stage 6 — Executor and Action Modules
+# Stage 6 — Runner and Action Modules
 
 ## Overview
 
-`PyreClient.Executor` receives action dispatches from the Channel, routes them to the appropriate action module, manages capacity, and handles the interactive loop. Action modules own the full execution lifecycle for their action type.
+`PyreClient.Runner` receives action dispatches from the Channel, routes them to the appropriate action module, manages capacity, and handles the interactive loop. Action modules own the full execution lifecycle for their action type.
 
 The server sends **named action types** with data parameters. The client has hardcoded implementations for each type. The server never sends shell commands or arbitrary code — the client decides what to execute based on its action modules. This is a security requirement: if the server could send commands over WebSocket, anyone with WebSocket access could compromise the client machine.
 
-The Executor has **no knowledge of workflows, stages, or orchestration**. It executes individual actions when triggered.
+The Runner has **no knowledge of workflows, stages, or orchestration**. It executes individual actions when triggered.
 
 ## Action Types
 
@@ -51,7 +51,7 @@ Non-interactive executions skip `action_result` entirely and go straight to `act
 Server pushes "action" event
   │
   ▼
-Channel.handle_message → Executor.handle_action/1
+Channel.handle_message → Runner.handle_action/1
   │
   ├─ 1. Route by action type
   │    Actions.resolve(payload["action"])
@@ -74,7 +74,7 @@ Channel.handle_message → Executor.handle_action/1
 Server pushes "action" event (interactive: true)
   │
   ▼
-Executor.handle_action/1 → spawns execution process
+Runner.handle_action/1 → spawns execution process
   │
   ├─ 1. Action module runs initial LLM call
   │    ├─ Stream tokens → "action_output"
@@ -83,19 +83,19 @@ Executor.handle_action/1 → spawns execution process
   ├─ 2. Send "action_result" (NOT "action_complete")
   │    └─ Execution process stays alive, capacity slot occupied
   │
-  ├─ 3. Block waiting for continuation message from Executor GenServer
+  ├─ 3. Block waiting for continuation message from RunnerGenServer
   │    │
   │    ├─ Server receives user reply → pushes "action_continue"
-  │    │    ├─ Channel routes to Executor.handle_continue/1
-  │    │    ├─ Executor forwards message to blocked execution process
+  │    │    ├─ Channel routes to Runner.handle_continue/1
+  │    │    ├─ Runnerforwards message to blocked execution process
   │    │    └─ Execution process resumes CLI session (resume: session_id)
   │    │         ├─ Stream tokens → "action_output"
   │    │         ├─ Send "action_result" with new result
   │    │         └─ Block again...
   │    │
   │    └─ Server sends "action_finish"
-  │         ├─ Channel routes to Executor.handle_finish/1
-  │         ├─ Executor signals execution process
+  │         ├─ Channel routes to Runner.handle_finish/1
+  │         ├─ Runnersignals execution process
   │         ├─ Action module runs post-LLM processing (git, GitHub, etc.)
   │         └─ Execution process sends "action_complete" and exits
   │
@@ -114,7 +114,7 @@ defmodule PyreClient.Actions do
   Action behaviour and routing registry.
 
   Each action type has a dedicated module that implements the full
-  execution lifecycle. The Executor routes to the correct module
+  execution lifecycle. The Runner routes to the correct module
   via `resolve/1`.
 
   ## Security Model
@@ -652,12 +652,12 @@ end
 
 ---
 
-## Module: `PyreClient.Executor` — Updated
+## Module: `PyreClient.Runner` — Updated
 
-The Executor GenServer is unchanged in structure. The key change: `execute/3` routes through `PyreClient.Actions.resolve/1` instead of pattern-matching on `"execute_prompt"`. The interactive loop remains shared infrastructure in the Executor.
+The Runner GenServer is unchanged in structure. The key change: `execute/3` routes through `PyreClient.Actions.resolve/1` instead of pattern-matching on `"execute_prompt"`. The interactive loop remains shared infrastructure in the Runner.
 
 ```elixir
-defmodule PyreClient.Executor do
+defmodule PyreClient.Runnerdo
   @moduledoc """
   Receives action dispatches, routes to action modules, manages capacity.
 
@@ -742,13 +742,13 @@ defmodule PyreClient.Executor do
       update_server_capacity(state)
       {:noreply, state}
     else
-      Logger.info("[PyreClient.Executor] At capacity, cannot execute #{execution_id}")
+      Logger.info("[PyreClient.Runner] At capacity, cannot execute #{execution_id}")
       {:noreply, state}
     end
   end
 
   def handle_cast(:on_disconnected, state) do
-    Logger.warning("[PyreClient.Executor] Disconnected, #{map_size(state.active_executions)} executions still running")
+    Logger.warning("[PyreClient.Runner] Disconnected, #{map_size(state.active_executions)} executions still running")
     {:noreply, state}
   end
 
@@ -757,7 +757,7 @@ defmodule PyreClient.Executor do
 
     case Map.get(state.active_executions, execution_id) do
       nil ->
-        Logger.warning("[PyreClient.Executor] action_continue for unknown execution #{execution_id}")
+        Logger.warning("[PyreClient.Runner] action_continue for unknown execution #{execution_id}")
         {:noreply, state}
 
       pid ->
@@ -771,7 +771,7 @@ defmodule PyreClient.Executor do
 
     case Map.get(state.active_executions, execution_id) do
       nil ->
-        Logger.warning("[PyreClient.Executor] action_finish for unknown execution #{execution_id}")
+        Logger.warning("[PyreClient.Runner] action_finish for unknown execution #{execution_id}")
         {:noreply, state}
 
       pid ->
@@ -808,12 +808,12 @@ defmodule PyreClient.Executor do
   # --- Execution Dispatch ---
 
   defp spawn_execution(execution_id, action_type, payload) do
-    executor_pid = self()
+    runner_pid = self()
 
     {pid, _ref} =
       spawn_monitor(fn ->
         execute(execution_id, action_type, payload)
-        send(executor_pid, {:execution_done, execution_id})
+        send(runner_pid, {:execution_done, execution_id})
       end)
 
     pid
@@ -847,7 +847,7 @@ defmodule PyreClient.Executor do
                 })
 
               {:error, reason} ->
-                Logger.error("[PyreClient.Executor] #{execution_id}: action error: #{inspect(reason)}")
+                Logger.error("[PyreClient.Runner] #{execution_id}: action error: #{inspect(reason)}")
                 send_to_server("action_complete", %{
                   "execution_id" => execution_id,
                   "status" => "error",
@@ -856,7 +856,7 @@ defmodule PyreClient.Executor do
             end
 
           {:error, reason} ->
-            Logger.error("[PyreClient.Executor] #{execution_id}: LLM error: #{inspect(reason)}")
+            Logger.error("[PyreClient.Runner] #{execution_id}: LLM error: #{inspect(reason)}")
             send_to_server("action_complete", %{
               "execution_id" => execution_id,
               "status" => "error",
@@ -865,7 +865,7 @@ defmodule PyreClient.Executor do
         end
 
       :error ->
-        Logger.warning("[PyreClient.Executor] #{execution_id}: unknown action type: #{action_type}")
+        Logger.warning("[PyreClient.Runner] #{execution_id}: unknown action type: #{action_type}")
         send_to_server("action_complete", %{
           "execution_id" => execution_id,
           "status" => "error",
@@ -898,7 +898,7 @@ defmodule PyreClient.Executor do
         user_message = payload["message"] || ""
         session_id = Keyword.get(context.opts, :session_id)
 
-        Logger.info("[PyreClient.Executor] #{execution_id}: interactive continue (session: #{session_id})")
+        Logger.info("[PyreClient.Runner] #{execution_id}: interactive continue (session: #{session_id})")
 
         messages = [%{role: :user, content: user_message}]
         resume_opts = Keyword.put(context.opts, :resume, session_id)
@@ -916,17 +916,17 @@ defmodule PyreClient.Executor do
             interactive_loop(execution_id, context, text)
 
           {:error, reason} ->
-            Logger.error("[PyreClient.Executor] #{execution_id}: interactive LLM error: #{inspect(reason)}")
+            Logger.error("[PyreClient.Runner] #{execution_id}: interactive LLM error: #{inspect(reason)}")
             {:error, reason}
         end
 
       :finish ->
-        Logger.info("[PyreClient.Executor] #{execution_id}: interactive finished")
+        Logger.info("[PyreClient.Runner] #{execution_id}: interactive finished")
         {:ok, last_text}
 
     after
       @execution_timeout ->
-        Logger.error("[PyreClient.Executor] #{execution_id}: interactive loop timed out")
+        Logger.error("[PyreClient.Runner] #{execution_id}: interactive loop timed out")
         {:error, :interactive_timeout}
     end
   end
@@ -1061,7 +1061,7 @@ The server loads persona files (`Pyre.Plugins.Persona.system_message/1`), assemb
 
 ### 5. Tools built locally from role info
 
-Tool definitions include callback functions that can't be serialized over WebSocket. The Executor builds `ReqLLM.Tool` structs locally via `PyreClient.Tools.for_role/3` from the `role`, `working_dir`, `allowed_paths`, and `allowed_commands` in the payload.
+Tool definitions include callback functions that can't be serialized over WebSocket. The Runner builds `ReqLLM.Tool` structs locally via `PyreClient.Tools.for_role/3` from the `role`, `working_dir`, `allowed_paths`, and `allowed_commands` in the payload.
 
 ### 6. Server owns session IDs
 
@@ -1073,7 +1073,7 @@ The server includes `interactive: true|false` in each action payload. This is th
 
 ### 8. Interactive loop is shared infrastructure
 
-The interactive loop (action_result → action_continue → action_result → action_finish) lives in the Executor, not in individual action modules. It always operates on the LLM portion. Post-LLM processing (git, GitHub, parsing) runs after the interactive loop completes. From the client's perspective, `action_continue` is always "resume the LLM session" — whether the message is a user reply or a finalize prompt.
+The interactive loop (action_result → action_continue → action_result → action_finish) lives in the Runner, not in individual action modules. It always operates on the LLM portion. Post-LLM processing (git, GitHub, parsing) runs after the interactive loop completes. From the client's perspective, `action_continue` is always "resume the LLM session" — whether the message is a user reply or a finalize prompt.
 
 ### 9. GitHub credentials via short-lived tokens
 
