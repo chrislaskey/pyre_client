@@ -51,12 +51,26 @@ Each client identifies itself when joining the server channel:
 ```elixir
 # config/runtime.exs
 config :pyre_client,
-  connection_id: System.get_env("PYRE_CONNECTION_ID"),
-  connection_name: System.get_env("PYRE_CONNECTION_NAME")
+  connection_id: System.get_env("PYRE_CLIENT_CONNECTION_ID"),
+  connection_name: System.get_env("PYRE_CLIENT_CONNECTION_NAME")
 ```
 
 If not set, `connection_id` defaults to a random hex string and
 `connection_name` defaults to the system hostname.
+
+### Service Token
+
+Authenticate with the server using a pre-shared service token:
+
+```elixir
+# config/runtime.exs
+config :pyre_client,
+  service_token: System.get_env("PYRE_CLIENT_WEBSOCKET_SERVICE_TOKEN")
+```
+
+Generate a token with `mix pyre.gen.token` (in the pyre_lib project). The
+token is sent as an HTTP header on socket connect and in the channel join
+payload — it never appears in the URL.
 
 ### LLM Backend
 

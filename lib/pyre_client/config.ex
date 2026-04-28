@@ -250,6 +250,10 @@ defmodule PyreClient.Config do
     Application.get_env(:pyre_client, :heartbeat_interval_ms, 30_000)
   end
 
+  def service_token do
+    Application.get_env(:pyre_client, :service_token)
+  end
+
   defp generate_connection_id do
     :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
   end

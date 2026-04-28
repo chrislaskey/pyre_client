@@ -43,6 +43,7 @@ defmodule PyreClient.Connection do
   def start_link do
     url = PyreClient.Config.server_url()
     connection_id = PyreClient.Config.connection_id()
+    token = PyreClient.Config.service_token()
 
     # Append connection_id and vsn for Phoenix V2 wire protocol
     url_with_params = append_params(url, %{"connection_id" => connection_id, "vsn" => "2.0.0"})
@@ -52,8 +53,11 @@ defmodule PyreClient.Connection do
       connected: false,
       server_url: url,
       connection_id: connection_id,
-      channel: Channel.new(connection_id)
+      channel: Channel.new(connection_id, token)
     }
+
+    extra_headers =
+      if token, do: [{"x-pyre-token", token}], else: []
 
     WebSockex.start_link(
       url_with_params,
@@ -61,7 +65,8 @@ defmodule PyreClient.Connection do
       state,
       name: __MODULE__,
       handle_initial_conn_failure: true,
-      async: true
+      async: true,
+      extra_headers: extra_headers
     )
   end
 

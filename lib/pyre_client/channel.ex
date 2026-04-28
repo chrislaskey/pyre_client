@@ -14,6 +14,7 @@ defmodule PyreClient.Channel do
 
   defstruct [
     :connection_id,
+    :token,
     :join_ref,
     :status,
     :pending_refs
@@ -28,10 +29,11 @@ defmodule PyreClient.Channel do
   # --- Initialization ---
 
   @doc "Create a new channel state."
-  @spec new(String.t()) :: t()
-  def new(connection_id) do
+  @spec new(String.t(), String.t() | nil) :: t()
+  def new(connection_id, token \\ nil) do
     %__MODULE__{
       connection_id: connection_id,
+      token: token,
       status: :disconnected,
       pending_refs: %{}
     }
@@ -65,6 +67,8 @@ defmodule PyreClient.Channel do
       "enabled_workflows" => PyreClient.Config.enabled_workflows(),
       "name" => PyreClient.Config.connection_name()
     }
+
+    payload = if ch.token, do: Map.put(payload, "token", ch.token), else: payload
 
     msg = Protocol.join(@topic, join_ref, payload)
 
