@@ -62,6 +62,7 @@ defmodule PyreClient.Channel do
     payload = %{
       "connection_id" => ch.connection_id,
       "status" => "active",
+      "max_capacity" => PyreClient.Config.max_capacity(),
       "available_capacity" => PyreClient.Config.available_capacity(),
       "backends" => PyreClient.Config.list_backends() |> Enum.map(& &1.name),
       "enabled_workflows" => PyreClient.Config.enabled_workflows(),

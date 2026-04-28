@@ -43,13 +43,15 @@ defmodule PyreClient.Config do
   @callback list_actions() :: [map()]
   @callback resolve_action(String.t()) :: {:ok, module()} | :error
   @callback resolve_model(String.t(), module()) :: String.t()
+  @callback max_capacity() :: non_neg_integer()
 
   @optional_callbacks [
     list_backends: 0,
     default_backend: 0,
     list_actions: 0,
     resolve_action: 1,
-    resolve_model: 2
+    resolve_model: 2,
+    max_capacity: 0
   ]
 
   defmacro __using__(_opts) do
@@ -112,6 +114,16 @@ defmodule PyreClient.Config do
       mod.resolve_model(tier, backend)
     else
       resolve_model_impl(tier, backend)
+    end
+  end
+
+  def max_capacity do
+    mod = config_module()
+
+    if mod != __MODULE__ and function_exported?(mod, :max_capacity, 0) do
+      mod.max_capacity()
+    else
+      default_max_capacity()
     end
   end
 
@@ -179,6 +191,12 @@ defmodule PyreClient.Config do
         name: "reserve",
         label: "Reserve",
         description: "Capacity reservation for workflow execution"
+      },
+      %{
+        module: PyreClient.Actions.TestConnection,
+        name: "test_connection",
+        label: "Test Connection",
+        description: "Simple connection health check"
       }
     ]
   end
@@ -202,6 +220,8 @@ defmodule PyreClient.Config do
       nil -> :error
     end
   end
+
+  defp default_max_capacity, do: 1
 
   @default_model_aliases %{
     "fast" => "anthropic:claude-haiku-4-5",

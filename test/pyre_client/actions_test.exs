@@ -8,6 +8,7 @@ defmodule PyreClient.ActionsTest do
     assert {:ok, PyreClient.Actions.GitPRSetup} = Actions.resolve("git_pr_setup")
     assert {:ok, PyreClient.Actions.GitShip} = Actions.resolve("git_ship")
     assert {:ok, PyreClient.Actions.GitReview} = Actions.resolve("git_review")
+    assert {:ok, PyreClient.Actions.TestConnection} = Actions.resolve("test_connection")
   end
 
   test "resolve returns :error for unknown action types" do
@@ -23,6 +24,7 @@ defmodule PyreClient.ActionsTest do
     assert "git_pr_setup" in names
     assert "git_ship" in names
     assert "git_review" in names
+    assert "test_connection" in names
   end
 
   test "included_actions returns action metadata maps" do

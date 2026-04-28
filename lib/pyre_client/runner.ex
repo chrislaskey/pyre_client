@@ -44,7 +44,7 @@ defmodule PyreClient.Runner do
   @impl true
   def init(_opts) do
     state = %__MODULE__{
-      max_capacity: PyreClient.Config.available_capacity(),
+      max_capacity: PyreClient.Config.max_capacity(),
       active_executions: %{},
       reserve_ids: MapSet.new()
     }
@@ -189,6 +189,10 @@ defmodule PyreClient.Runner do
     execute_reserve(execution_id)
   end
 
+  defp execute(execution_id, "test_connection", _payload) do
+    execute_test_connection(execution_id)
+  end
+
   defp execute(execution_id, action_type, payload) do
     case PyreClient.Actions.resolve(action_type) do
       {:ok, action_module} ->
@@ -271,6 +275,22 @@ defmodule PyreClient.Runner do
       @execution_timeout ->
         Logger.error("[PyreClient.Runner] #{execution_id}: reserve — timed out")
     end
+  end
+
+  # --- Test Connection ---
+
+  defp execute_test_connection(execution_id) do
+    Logger.info("[PyreClient.Runner] #{execution_id}: test_connection — responding")
+
+    timestamp = DateTime.utc_now() |> DateTime.to_iso8601()
+
+    send_to_server("action_complete", %{
+      "execution_id" => execution_id,
+      "status" => "ok",
+      "result" => %{
+        "message" => "Received test connection request! Responded at #{timestamp}"
+      }
+    })
   end
 
   # --- Interactive Loop ---
@@ -442,6 +462,7 @@ defmodule PyreClient.Runner do
 
   defp update_server_capacity(state) do
     PyreClient.Connection.update_metadata(%{
+      "max_capacity" => state.max_capacity,
       "available_capacity" => current_available_capacity(state)
     })
   end
