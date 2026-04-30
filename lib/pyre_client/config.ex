@@ -7,7 +7,7 @@ defmodule PyreClient.Config do
   Connection settings read from application env:
 
       PyreClient.Config.server_url()
-      PyreClient.Config.available_capacity()
+      PyreClient.Config.max_capacity()
 
   ## Overridable callbacks
 
@@ -221,7 +221,9 @@ defmodule PyreClient.Config do
     end
   end
 
-  defp default_max_capacity, do: 1
+  defp default_max_capacity do
+    Application.get_env(:pyre_client, :max_capacity, 1)
+  end
 
   @default_model_aliases %{
     "fast" => "anthropic:claude-haiku-4-5",
@@ -248,10 +250,6 @@ defmodule PyreClient.Config do
 
   def connection_name do
     Application.get_env(:pyre_client, :connection_name) || default_name()
-  end
-
-  def available_capacity do
-    Application.get_env(:pyre_client, :available_capacity, 1)
   end
 
   def backends do

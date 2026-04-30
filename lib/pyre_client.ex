@@ -18,7 +18,7 @@ defmodule PyreClient do
       config :pyre_client,
         server_url: "ws://localhost:4000/websocket",
         connection_id: "my-worker",
-        available_capacity: 1,
+        max_capacity: 1,
         llm_backend: :claude_cli
 
   Start in your supervision tree:

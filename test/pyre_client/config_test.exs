@@ -86,14 +86,8 @@ defmodule PyreClient.ConfigTest do
     assert is_binary(Config.connection_id())
   end
 
-  test "available_capacity defaults to 1" do
-    original = Application.get_env(:pyre_client, :available_capacity)
-    Application.delete_env(:pyre_client, :available_capacity)
-    assert Config.available_capacity() == 1
-
-    if original do
-      Application.put_env(:pyre_client, :available_capacity, original)
-    end
+  test "max_capacity defaults to 1" do
+    assert Config.max_capacity() == 1
   end
 
   test "ping_interval_ms has a default" do
