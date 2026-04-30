@@ -26,6 +26,17 @@ defmodule PyreClient.Runner do
   # 24 hours — matches workflow-level timeout
   @execution_timeout 86_400_000
 
+  @resumed_conversation_note """
+  NOTE: This is a resumed conversation, but we don't have a reference session \
+  ID. Do your best to pick up context based on local or remote changes. Then \
+  reply back to the user telling them you don't have access to the previous \
+  discussion, but here is what you do know based on the prompt and existing \
+  code (which can also be nothing — "I don't have enough to go on yet" — or \
+  if you do have some: "here is my understanding..."), and then ask some \
+  clarifying questions for the user so in the next response you can start \
+  doing work.\
+  """
+
   # --- Start ---
 
   def start_link(opts \\ []) do
@@ -126,11 +137,14 @@ defmodule PyreClient.Runner do
 
     case Map.get(state.active_executions, execution_id) do
       nil ->
-        Logger.warning(
-          "[PyreClient.Runner] action_continue for unknown execution #{execution_id}"
+        Logger.info(
+          "[PyreClient.Runner] action_continue for unknown execution #{execution_id}, " <>
+            "starting recovery session"
         )
 
-        {:noreply, state}
+        pid = spawn_recovery_session(execution_id, payload)
+        active = Map.put(state.active_executions, execution_id, pid)
+        {:noreply, %{state | active_executions: active}}
 
       pid ->
         send(pid, {:continue, payload})
@@ -143,7 +157,15 @@ defmodule PyreClient.Runner do
 
     case Map.get(state.active_executions, execution_id) do
       nil ->
-        Logger.warning("[PyreClient.Runner] action_finish for unknown execution #{execution_id}")
+        Logger.info(
+          "[PyreClient.Runner] action_finish for unknown execution #{execution_id}, acking"
+        )
+
+        send_to_server("action_complete", %{
+          "execution_id" => execution_id,
+          "status" => "ok",
+          "result" => %{}
+        })
 
         {:noreply, state}
 
@@ -220,7 +242,7 @@ defmodule PyreClient.Runner do
         # Phase 1: LLM call (+ interactive loop if interactive)
         llm_result =
           if context.interactive? do
-            execute_interactive(execution_id, context)
+            start_interactive_session(execution_id, context)
           else
             PyreClient.Actions.LLM.call(context)
           end
@@ -312,10 +334,12 @@ defmodule PyreClient.Runner do
     })
   end
 
-  # --- Interactive Loop ---
+  # --- Interactive Session ---
 
-  defp execute_interactive(execution_id, context) do
-    # Run initial LLM call
+  # Shared entry point for interactive sessions. Makes the initial LLM call,
+  # sends the result back to the server, and enters the interactive loop.
+  # Used by both normal action dispatch and recovery from unknown continues.
+  defp start_interactive_session(execution_id, context) do
     case PyreClient.Actions.LLM.call(context) do
       {:ok, text} ->
         send_to_server("action_result", %{
@@ -370,6 +394,78 @@ defmodule PyreClient.Runner do
       @execution_timeout ->
         Logger.error("[PyreClient.Runner] #{execution_id}: interactive loop timed out")
         {:error, :interactive_timeout}
+    end
+  end
+
+  # --- Recovery Session ---
+
+  # Spawns a new interactive session when action_continue arrives for an
+  # execution_id we don't recognize (e.g., after a client restart). Creates
+  # a fresh session ID and runs the initial LLM call with the user's message
+  # plus a note explaining the session context was lost.
+  defp spawn_recovery_session(execution_id, payload) do
+    runner_pid = self()
+
+    {pid, _ref} =
+      spawn_monitor(fn ->
+        execute_recovery_session(execution_id, payload)
+        send(runner_pid, {:execution_done, execution_id})
+      end)
+
+    pid
+  end
+
+  defp execute_recovery_session(execution_id, payload) do
+    user_message = payload["message"] || ""
+    working_dir = payload["working_dir"]
+    new_session_id = PyreClient.Session.generate_id()
+
+    backend = PyreClient.Config.default_backend()
+    model = PyreClient.Config.resolve_model("standard", backend)
+
+    prompt = @resumed_conversation_note <> "\n\nUser message:\n" <> user_message
+
+    messages = [%{role: :user, content: prompt}]
+
+    tools = build_tools("generalist", working_dir, [working_dir || "."], nil)
+
+    opts = [
+      messages: messages,
+      session_id: new_session_id,
+      streaming: true,
+      working_dir: working_dir
+    ]
+
+    output_fn = fn token -> send_output(execution_id, token) end
+
+    context = %{
+      execution_id: execution_id,
+      backend: backend,
+      model: model,
+      tools: tools,
+      opts: opts,
+      output_fn: output_fn,
+      send_to_server: &send_to_server/2,
+      interactive?: true
+    }
+
+    Logger.info(
+      "[PyreClient.Runner] #{execution_id}: recovery session started " <>
+        "(session: #{new_session_id}, working_dir: #{inspect(working_dir)})"
+    )
+
+    case start_interactive_session(execution_id, context) do
+      {:ok, _text} -> :ok
+      {:error, reason} ->
+        Logger.error(
+          "[PyreClient.Runner] #{execution_id}: recovery session error: #{inspect(reason)}"
+        )
+
+        send_to_server("action_complete", %{
+          "execution_id" => execution_id,
+          "status" => "error",
+          "result" => %{"error" => inspect(reason)}
+        })
     end
   end
 
