@@ -36,7 +36,7 @@ Point the client at your Pyre Web server:
 ```elixir
 # config/runtime.exs
 config :pyre_client,
-  server_url: System.get_env("PYRE_SERVER_URL", "ws://localhost:4000/websocket")
+  server_url: System.get_env("PYRE_CLIENT_WEBSOCKET_URL", "ws://localhost:4000/websocket")
 ```
 
 The WebSocket path must match the socket mount path in the host app's endpoint.
