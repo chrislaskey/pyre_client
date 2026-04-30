@@ -17,10 +17,10 @@ defmodule PyreClient.Runner do
 
   defstruct [
     :max_capacity,
-    # %{execution_id => pid}
+    # %{execution_id => pid} — all spawned processes (routing + cleanup)
     :active_executions,
-    # MapSet of execution_ids that are reserve holds (not real work)
-    :reserve_ids
+    # %{reservation_id => pid} — reserves only, the capacity gate
+    :workflow_slots
   ]
 
   # 24 hours — matches workflow-level timeout
@@ -46,7 +46,7 @@ defmodule PyreClient.Runner do
     state = %__MODULE__{
       max_capacity: PyreClient.Config.max_capacity(),
       active_executions: %{},
-      reserve_ids: MapSet.new()
+      workflow_slots: %{}
     }
 
     {:ok, state}
@@ -81,21 +81,35 @@ defmodule PyreClient.Runner do
     execution_id = payload["execution_id"]
     action_type = payload["action"]
 
-    if has_capacity?(state) do
-      pid = spawn_execution(execution_id, action_type, payload)
-      active = Map.put(state.active_executions, execution_id, pid)
+    cond do
+      action_type == "reserve" and not has_workflow_capacity?(state) ->
+        Logger.info("[PyreClient.Runner] No workflow slots, rejecting reserve #{execution_id}")
 
-      reserve_ids =
-        if action_type == "reserve",
-          do: MapSet.put(state.reserve_ids, execution_id),
-          else: state.reserve_ids
+        send_to_server("action_output", %{
+          "execution_id" => execution_id,
+          "type" => "ack",
+          "status" => "rejected"
+        })
 
-      state = %{state | active_executions: active, reserve_ids: reserve_ids}
-      update_server_capacity(state)
-      {:noreply, state}
-    else
-      Logger.info("[PyreClient.Runner] At capacity, cannot execute #{execution_id}")
-      {:noreply, state}
+        {:noreply, state}
+
+      action_type == "reserve" ->
+        pid = spawn_execution(execution_id, action_type, payload)
+        active = Map.put(state.active_executions, execution_id, pid)
+        slots = Map.put(state.workflow_slots, execution_id, pid)
+        state = %{state | active_executions: active, workflow_slots: slots}
+        update_server_capacity(state)
+        {:noreply, state}
+
+      not under_safety_cap?(state) ->
+        Logger.info("[PyreClient.Runner] Safety cap reached, cannot execute #{execution_id}")
+        {:noreply, state}
+
+      true ->
+        pid = spawn_execution(execution_id, action_type, payload)
+        active = Map.put(state.active_executions, execution_id, pid)
+        state = %{state | active_executions: active}
+        {:noreply, state}
     end
   end
 
@@ -142,9 +156,10 @@ defmodule PyreClient.Runner do
   @impl true
   def handle_info({:execution_done, execution_id}, state) do
     active = Map.delete(state.active_executions, execution_id)
-    reserve_ids = MapSet.delete(state.reserve_ids, execution_id)
-    state = %{state | active_executions: active, reserve_ids: reserve_ids}
-    update_server_capacity(state)
+    had_slot = Map.has_key?(state.workflow_slots, execution_id)
+    slots = Map.delete(state.workflow_slots, execution_id)
+    state = %{state | active_executions: active, workflow_slots: slots}
+    if had_slot, do: update_server_capacity(state)
     {:noreply, state}
   end
 
@@ -160,9 +175,13 @@ defmodule PyreClient.Runner do
         |> Enum.reject(fn {_id, p} -> p == pid end)
         |> Map.new()
 
-      reserve_ids = Enum.reduce(removed_ids, state.reserve_ids, &MapSet.delete(&2, &1))
-      state = %{state | active_executions: active, reserve_ids: reserve_ids}
-      update_server_capacity(state)
+      slots_changed = Enum.any?(removed_ids, &Map.has_key?(state.workflow_slots, &1))
+
+      slots =
+        Enum.reduce(removed_ids, state.workflow_slots, fn id, acc -> Map.delete(acc, id) end)
+
+      state = %{state | active_executions: active, workflow_slots: slots}
+      if slots_changed, do: update_server_capacity(state)
       {:noreply, state}
     else
       {:noreply, state}
@@ -442,18 +461,16 @@ defmodule PyreClient.Runner do
 
   # --- Helpers ---
 
-  defp has_capacity?(state) do
-    # Reserve executions are coordination holds (blocked waiting for :finish),
-    # not real work. Only count non-reserve executions against capacity.
-    # Reserves still count in the capacity reported to the server (via
-    # current_available_capacity/1), preventing other workflows from being
-    # dispatched to this client.
-    work_count = map_size(state.active_executions) - MapSet.size(state.reserve_ids)
-    work_count < state.max_capacity
+  defp has_workflow_capacity?(state) do
+    map_size(state.workflow_slots) < state.max_capacity
+  end
+
+  defp under_safety_cap?(state) do
+    map_size(state.active_executions) < state.max_capacity * 3
   end
 
   defp current_available_capacity(state) do
-    state.max_capacity - map_size(state.active_executions)
+    state.max_capacity - map_size(state.workflow_slots)
   end
 
   defp send_to_server(event, payload) do
