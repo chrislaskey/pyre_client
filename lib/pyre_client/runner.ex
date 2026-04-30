@@ -466,7 +466,7 @@ defmodule PyreClient.Runner do
   end
 
   defp under_safety_cap?(state) do
-    map_size(state.active_executions) < state.max_capacity * 3
+    map_size(state.active_executions) < max(state.max_capacity * 3, 1)
   end
 
   defp current_available_capacity(state) do
