@@ -455,7 +455,9 @@ defmodule PyreClient.Runner do
     )
 
     case start_interactive_session(execution_id, context) do
-      {:ok, _text} -> :ok
+      {:ok, _text} ->
+        :ok
+
       {:error, reason} ->
         Logger.error(
           "[PyreClient.Runner] #{execution_id}: recovery session error: #{inspect(reason)}"

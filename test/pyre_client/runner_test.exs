@@ -110,7 +110,10 @@ defmodule PyreClient.RunnerTest do
       assert_receive {:server_cast, {:send_event, "action_result", _}}, 5_000
 
       # Send finish to end the interactive loop
-      GenServer.cast(PyreClient.Runner, {:handle_finish, %{"execution_id" => "recovery-finish-1"}})
+      GenServer.cast(
+        PyreClient.Runner,
+        {:handle_finish, %{"execution_id" => "recovery-finish-1"}}
+      )
 
       # Wait for process to complete and be cleaned up from active_executions
       assert_eventually(fn ->
