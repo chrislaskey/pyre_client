@@ -94,20 +94,20 @@ Available backends:
 ### Allowed Paths
 
 Agent file tools (read, write, list directory) are sandboxed to explicitly
-configured paths. Configure the base allowed paths via the `PYRE_ALLOWED_PATHS`
+configured paths. Configure the base allowed paths via the `PYRE_CLIENT_ALLOWED_PATHS`
 environment variable or application config.
 
 **Environment variable** (comma-separated):
 
 ```bash
-export PYRE_ALLOWED_PATHS="/path/to/apps/other,/path/to/libs/shared"
+export PYRE_CLIENT_ALLOWED_PATHS="/path/to/apps/other,/path/to/libs/shared"
 ```
 
 **Application config:**
 
 ```elixir
 # config/runtime.exs
-if paths = System.get_env("PYRE_ALLOWED_PATHS") do
+if paths = System.get_env("PYRE_CLIENT_ALLOWED_PATHS") do
   config :pyre_client,
     allowed_paths:
       paths
@@ -117,10 +117,9 @@ if paths = System.get_env("PYRE_ALLOWED_PATHS") do
 end
 ```
 
-The client merges these base paths with any additional paths sent by the
-server in action payloads (e.g., flow-specific feature directories). The
-server can pass extra paths via the `:allowed_paths` flow option without
-needing to duplicate the base configuration.
+The client uses only its locally configured paths — the server does not
+send allowed paths. This ensures the client retains full control over
+filesystem access even if the server is compromised.
 
 ### API Keys
 

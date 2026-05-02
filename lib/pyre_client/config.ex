@@ -276,7 +276,7 @@ defmodule PyreClient.Config do
   Returns the configured allowed paths for file tool sandboxing.
 
   Reads from `config :pyre_client, :allowed_paths`. Typically set via the
-  `PYRE_ALLOWED_PATHS` environment variable (comma-separated, expanded).
+  `PYRE_CLIENT_ALLOWED_PATHS` environment variable (comma-separated, expanded).
 
   Returns an empty list when not configured.
   """
