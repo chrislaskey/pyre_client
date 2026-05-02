@@ -272,6 +272,21 @@ defmodule PyreClient.Config do
     Application.get_env(:pyre_client, :service_token)
   end
 
+  @doc """
+  Returns the configured allowed paths for file tool sandboxing.
+
+  Reads from `config :pyre_client, :allowed_paths`. Typically set via the
+  `PYRE_CLIENT_ALLOWED_PATHS` environment variable (comma-separated, expanded).
+
+  Returns an empty list when not configured.
+  """
+  def allowed_paths do
+    case Application.get_env(:pyre_client, :allowed_paths) do
+      nil -> []
+      paths when is_list(paths) -> paths
+    end
+  end
+
   defp generate_connection_id do
     :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
   end

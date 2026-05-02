@@ -427,7 +427,8 @@ defmodule PyreClient.Runner do
 
     messages = [%{role: :user, content: prompt}]
 
-    tools = build_tools("generalist", working_dir, [working_dir || "."], nil)
+    recovery_paths = PyreClient.Config.allowed_paths()
+    tools = build_tools("generalist", working_dir, recovery_paths, nil)
 
     opts = [
       messages: messages,
@@ -478,7 +479,7 @@ defmodule PyreClient.Runner do
     model_tier = inner["model_tier"] || "standard"
     role = inner["role"]
     working_dir = inner["working_dir"]
-    allowed_paths = inner["allowed_paths"] || []
+    allowed_paths = PyreClient.Config.allowed_paths()
     allowed_commands = inner["allowed_commands"]
     opts_map = inner["opts"] || %{}
 
@@ -581,4 +582,5 @@ defmodule PyreClient.Runner do
       "available_capacity" => current_available_capacity(state)
     })
   end
+
 end

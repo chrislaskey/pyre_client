@@ -80,7 +80,7 @@ defmodule PyreClient.Tools do
     case Keyword.get(opts, :allowed_paths, []) do
       [] ->
         raise ArgumentError,
-              "No allowed paths configured. Set PYRE_ALLOWED_PATHS environment variable " <>
+              "No allowed paths configured. Set PYRE_CLIENT_ALLOWED_PATHS environment variable " <>
                 "or pass the :allowed_paths option to for_role/3."
 
       paths ->

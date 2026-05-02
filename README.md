@@ -91,6 +91,36 @@ Available backends:
 | `PyreClient.LLM.CursorCLI` | `:cursor_cli` | Cursor CLI subprocess |
 | `PyreClient.LLM.CodexCLI` | `:codex_cli` | OpenAI Codex CLI subprocess |
 
+### Allowed Paths
+
+Agent file tools (read, write, list directory) are sandboxed to explicitly
+configured paths. Configure the base allowed paths via the `PYRE_CLIENT_ALLOWED_PATHS`
+environment variable or application config.
+
+**Environment variable** (comma-separated):
+
+```bash
+export PYRE_CLIENT_ALLOWED_PATHS="/path/to/apps/other,/path/to/libs/shared"
+```
+
+**Application config:**
+
+```elixir
+# config/runtime.exs
+if paths = System.get_env("PYRE_CLIENT_ALLOWED_PATHS") do
+  config :pyre_client,
+    allowed_paths:
+      paths
+      |> String.split(",", trim: true)
+      |> Enum.map(&String.trim/1)
+      |> Enum.map(&Path.expand/1)
+end
+```
+
+The client uses only its locally configured paths — the server does not
+send allowed paths. This ensures the client retains full control over
+filesystem access even if the server is compromised.
+
 ### API Keys
 
 When using the `req_llm` backend, set at least one API key:
